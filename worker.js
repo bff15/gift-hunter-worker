@@ -162,249 +162,40 @@ function extractLinks(html, baseUrl) {
     .filter((x) => {
       const key = x.url.split("#")[0];
 
-      if (seen.has(key))    .replace(/&gt;/gi, ">");
+      if (seen.has(key)) return false;
+
+      seen.add(key);
+      return true;
+    })
+    .slice(0, MAX_DISCOVERED_LINKS);
 }
 
-function absoluteUrl(base, href) {
-  try {
-    return new URL(href, base).href;
-  } catch {
-    return "";
-  }
-}
+function extractMeta(html) {
+  const result = {};
 
-function sameOrRelatedHost(a, b) {
-  try {
-    const ah = new URL(a).hostname.replace(/^www\./, "");
-    const bh = new URL(b).hostname.replace(/^www\./, "");
-    return ah === bh;
-  } catch {
-    return false;
-  }
-}
+  const re =
+    /<meta\b[^>]*(?:name|property)\s*=\s*["']([^"']+)["'][^>]*content\s*=\s*["']([^"']*)["'][^>]*>/gi;
 
-function titleFromUrl(url) {
-  try {
-    const p = new URL(url).pathname.split("/").filter(Boolean).pop() || "";
-    return decodeURIComponent(p)
-      .replace(/\.(html?|php|aspx?)$/i, "")
-      .replace(/[-_]+/g, " ")
-      .replace(/\b\w/g, c => c.toUpperCase())
-      .slice(0, 180);
-  } catch {
-    return "";
-  }
-}
-
-function parseMeta(html, baseUrl) {
-  const out = {};
-  const metaRe = /<meta\b[^>]*(?:property|name)\s*=\s*["']([^"']+)["'][^>]*content\s*=\s*["']([^"']*)["'][^>]*>/gi;
   let m;
 
-  while ((m = metaRe.exec(html))) {
+  while ((m = re.exec(html))) {
     const key = m[1].toLowerCase();
 
     if (
-      [
-        "og:title",
-        "og:description",
-        "og:url",
-        "description",
-        "twitter:title",
-        "twitter:description"
-      ].includes(key)
+      key === "og:title" ||
+      key === "og:description" ||
+      key === "description" ||
+      key === "twitter:title" ||
+      key === "twitter:description"
     ) {
-      out[key] = decodeHtml(m[2]);
+      result[key] = cleanText(m[2]);
     }
   }
 
-  if (out["og:url"]) {
-    out.url = absoluteUrl(baseUrl, out["og:url"]);
-  }
-
-  return out;
+  return result;
 }
 
-function extractJsonLd(html, baseUrl) {
-  const items = [];
-  const re =
-    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-
-  let m;
-
-  while ((m = re.exec(html))) {
-    const raw = m[1].trim();
-
-    if (!raw) continue;
-
-    try {
-      const data = JSON.parse(raw);
-      const stack = Array.isArray(data) ? [...data] : [data];
-
-      while (stack.length) {
-        const x = stack.shift();
-
-        if (!x || typeof x !== "object") continue;
-
-        if (Array.isArray(x)) {
-          stack.push(...x);
-          continue;
-        }
-
-        if (x["@graph"] && Array.isArray(x["@graph"])) {
-          stack.push(...x["@graph"]);
-        }
-
-        const type = Array.isArray(x["@type"])
-          ? x["@type"].join(" ")
-          : String(x["@type"] || "");
-
-        const title = x.name || x.headline || x.title;
-        const description = x.description || x.abstract || "";
-
-        const url = absoluteUrl(
-          baseUrl,
-          x.url || x.mainEntityOfPage || ""
-        );
-
-        const text = cleanText(
-          [
-            title,
-            description,
-            x.text,
-            x.offers?.price,
-            x.offers?.priceCurrency
-          ]
-            .filter(Boolean)
-            .join(" ")
-        );
-
-        if (
-          title &&
-          (url || MONEY_RE.test(text) || FREE_RE.test(text))
-        ) {
-          items.push({
-            title: cleanText(title),
-            description: cleanText(description),
-            url: url || baseUrl,
-            type: cleanText(type),
-            sourceText: text
-          });
-        }
-      }
-    } catch {}
-  }
-
-  return items;
-}
-
-function extractAnchors(html, baseUrl) {
-  const items = [];
-
-  const re =
-    /<a\b([^>]*?)href\s*=\s*["']([^"']+)["']([^>]*)>([\s\S]*?)<\/a>/gi;
-
-  let m;
-
-  while ((m = re.exec(html))) {
-    const href = absoluteUrl(baseUrl, m[2]);
-
-    if (!href || !/^https?:\/\//i.test(href)) continue;
-
-    if (
-      /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|rar)(?:$|\?)/i.test(href)
-    ) {
-      continue;
-    }
-
-    const anchorText = stripHtml(m[4]);
-    const attrs = cleanText(`${m[1]} ${m[3]}`);
-
-    const contextStart = Math.max(0, m.index - 900);
-    const contextEnd = Math.min(
-      html.length,
-      re.lastIndex + 1400
-    );
-
-    const context = stripHtml(
-      html.slice(contextStart, contextEnd)
-    );
-
-    const combined = cleanText(
-      `${anchorText} ${attrs} ${context}`
-    );
-
-    const score =
-      (MONEY_RE.test(combined) ? 4 : 0) +
-      (FREE_RE.test(combined) ? 3 : 0) +
-      (NEGATIVE_RE.test(combined) ? -2 : 0) +
-      (anchorText.length >= 8 ? 1 : 0);
-
-    if (score < 3) continue;
-
-    items.push({
-      title: anchorText || titleFromUrl(href),
-      description: context.slice(0, 7000),
-      url: href,
-      type: "Discovered offer",
-      sourceText: combined,
-      score
-    });
-  }
-
-  return items;
-}
-
-function dedupeCandidates(items) {
-  const map = new Map();
-
-  for (const item of items) {
-    const url = item.url || "";
-
-    if (!url) continue;
-
-    let u;
-
-    try {
-      u = new URL(url);
-      u.hash = "";
-    } catch {
-      continue;
-    }
-
-    if (
-      /\/(?:login|signin|sign-in|signup|register|account|cart|checkout)\b/i.test(
-        u.pathname
-      )
-    ) {
-      continue;
-    }
-
-    const key = u.href;
-    const existing = map.get(key);
-
-    if (
-      !existing ||
-      Number(item.score || 0) >
-        Number(existing.score || 0)
-    ) {
-      map.set(key, {
-        ...item,
-        url: key
-      });
-    }
-  }
-
-  return [...map.values()]
-    .sort(
-      (a, b) =>
-        Number(b.score || 0) -
-        Number(a.score || 0)
-    )
-    .slice(0, MAX_CANDIDATES_PER_SOURCE);
-}
-
-async function fetchText(url) {
+async function fetchPage(url) {
   const controller = new AbortController();
 
   const timer = setTimeout(
@@ -413,575 +204,562 @@ async function fetchText(url) {
   );
 
   try {
-    const res = await fetch(url, {
+    const u = new URL(url);
+
+    if (
+      u.protocol !== "https:" ||
+      !hostAllowed(u.hostname)
+    ) {
+      throw new Error("Invalid source URL");
+    }
+
+    const response = await fetch(u.toString(), {
       method: "GET",
       redirect: "follow",
       signal: controller.signal,
 
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (compatible; GiftHunter/2.0; +https://workers.dev)"
-      }
+          "Gift-Hunter/2.0 source-reader",
+        "Accept":
+          "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8",
+      },
     });
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
 
-    const contentType =
-      res.headers.get("content-type") || "";
+    const type =
+      response.headers.get("content-type") || "";
 
-    if (
-      contentType &&
-      !/text\/html|application\/xhtml\+xml|text\/plain|application\/json/i.test(
-        contentType
-      )
-    ) {
-      throw new Error(
-        `Unsupported content type: ${contentType}`
-      );
-    }
+    const raw = await response.text();
 
-    const text = await res.text();
+    const text = /json/i.test(type)
+      ? cleanText(raw)
+      : stripHtml(raw);
 
     return {
-      finalUrl: res.url || url,
-      html: text.slice(0, MAX_SOURCE_BYTES),
-      contentType
+      requestedUrl: url,
+      finalUrl: response.url || url,
+      contentType: type,
+      raw: raw.slice(0, 700000),
+      text: text.slice(0, MAX_PAGE_TEXT),
+      meta: /json/i.test(type)
+        ? {}
+        : extractMeta(raw),
     };
   } finally {
     clearTimeout(timer);
   }
 }
 
-function discoverCandidates(sourceUrl, html) {
-  const meta = parseMeta(html, sourceUrl);
-  const jsonLd = extractJsonLd(html, sourceUrl);
-  const anchors = extractAnchors(html, sourceUrl);
+function buildSourcePackage(page) {
+  const links = extractLinks(
+    page.raw,
+    page.finalUrl
+  );
 
-  const sourceText =
-    stripHtml(html).slice(0, MAX_TEXT);
-
-  const all = [
-    ...jsonLd.map(x => ({
-      ...x,
-      score: 5
-    })),
-    ...anchors
-  ];
-
-  if (
-    MONEY_RE.test(sourceText) &&
-    FREE_RE.test(sourceText)
-  ) {
-    all.push({
-      title:
-        meta["og:title"] ||
-        meta["twitter:title"] ||
-        titleFromUrl(sourceUrl),
-
-      description:
-        meta["og:description"] ||
-        meta["twitter:description"] ||
-        sourceText.slice(0, 7000),
-
-      url: sourceUrl,
-
-      type: "Source page offer",
-
-      sourceText,
-
-      score: 4
-    });
-  }
-
-  return dedupeCandidates(all);
-}
-
-function buildPrompt(candidate) {
-  const rulesText = RULES
-    .map(r => `${r.id}. ${r.name}`)
+  const linkText = links
+    .map(
+      (x, i) =>
+        `${i + 1}. ${
+          x.text || titleFromUrl(x.url)
+        } | ${x.url}`
+    )
     .join("\n");
 
-  return `
-أنت محقق عروض مجانية شديد الصرامة.
+  return {
+    name: page.finalUrl,
+    url: page.finalUrl,
 
-مهمتك ليست تخمين أن العرض مجاني.
-يجب أن تثبت كل شرط من الشروط الـ37 من النص المتاح.
+    text: [
+      "PAGE TEXT:",
+      page.text,
+      "",
+      "META:",
+      JSON.stringify(page.meta),
+      "",
+      "DISCOVERED LINKS:",
+      linkText,
+    ]
+      .join("\n")
+      .slice(0, MAX_SOURCE_TEXT),
 
-قواعد القرار:
-
-1) PASS = الشرط مثبت بوضوح من النص.
-2) FAIL = النص يثبت أن الشرط مخالف أو مطلوب.
-3) UNKNOWN = لا توجد أدلة كافية.
-4) أي UNKNOWN يعني رفض العرض.
-5) أي FAIL يعني رفض العرض.
-6) لا تعتبر كلمة "free" وحدها دليلًا على كل الشروط.
-7) لا تفترض أن التسجيل مجاني أو أن الرسوم غير موجودة إذا لم يذكر المصدر ذلك.
-8) يجب أن تكون المكافأة نفسها مالية أو عملة رقمية ذات قيمة.
-9) يجب أن يكون العرض مجانيًا بالكامل دون مقابل.
-10) أعد JSON فقط، بلا Markdown.
-
-الشروط:
-
-${rulesText}
-
-العرض:
-
-العنوان:
-${cleanText(candidate.title)}
-
-الرابط:
-${candidate.url}
-
-الوصف:
-${cleanText(candidate.description)}
-
-النوع:
-${cleanText(candidate.type)}
-
-نص الدليل:
-${cleanText(candidate.sourceText).slice(0, MAX_TEXT)}
-
-أعد:
-
-{
-  "eligible": false,
-  "passed": 0,
-  "failed": 0,
-  "unknown": 0,
-  "rules": [
-    {
-      "id": 1,
-      "status": "PASS|FAIL|UNKNOWN",
-      "evidence": "دليل قصير من النص"
-    }
-  ],
-  "reason": "سبب مختصر"
+    links,
+  };
 }
 
-يجب أن تحتوي rules على جميع الأرقام 1 إلى 37.
+function selectOfferLinks(source) {
+  return source.links
+    .filter((x) =>
+      sameHost(x.url, source.url)
+    )
+    .filter((x) => x.score >= 3)
+    .slice(0, MAX_OFFER_PAGES);
+}
+
+async function readSources(items) {
+  const sources = [];
+
+  for (const item of items) {
+    try {
+      const page = await fetchPage(
+        String(item.url || "").trim()
+      );
+
+      const source =
+        buildSourcePackage(page);
+
+      source.name =
+        item.name ||
+        new URL(page.finalUrl).hostname;
+
+      sources.push(source);
+
+      const offerLinks =
+        selectOfferLinks(source);
+
+      for (const link of offerLinks) {
+        if (
+          sources.length >=
+          items.length + MAX_OFFER_PAGES
+        ) {
+          break;
+        }
+
+        try {
+          const offerPage =
+            await fetchPage(link.url);
+
+          sources.push({
+            name: source.name,
+            url: offerPage.finalUrl,
+
+            text: [
+              `SOURCE PAGE: ${source.url}`,
+              `OFFER PAGE: ${offerPage.finalUrl}`,
+              "",
+              "OFFER PAGE TEXT:",
+              offerPage.text,
+              "",
+              "OFFER META:",
+              JSON.stringify(
+                offerPage.meta
+              ),
+            ]
+              .join("\n")
+              .slice(0, MAX_SOURCE_TEXT),
+
+            links: [],
+            discoveredFrom: source.url,
+          });
+        } catch {
+          // فشل الصفحة الفرعية لا يوقف المصدر.
+        }
+      }
+    } catch {
+      // فشل مصدر واحد لا يوقف الدفعة.
+    }
+  }
+
+  return sources;
+}
+
+function rulesToText(rules) {
+  if (
+    !Array.isArray(rules) ||
+    !rules.length
+  ) {
+    return (
+      "The application supplied no rule definitions. " +
+      "Do not invent missing rules."
+    );
+  }
+
+  return rules
+    .map((r) => {
+      return [
+        `RULE ${r.id}: ${r.name || ""}`,
+        `Forbidden indicators: ${
+          (r.bad || []).join(", ")
+        }`,
+        `Required positive evidence: ${
+          (r.good || []).join(", ")
+        }`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function buildPrompt(sources, rules) {
+  const sourceText = sources
+    .map((s, i) => {
+      return [
+        `SOURCE ${i + 1}`,
+        `NAME: ${s.name}`,
+        `URL: ${s.url}`,
+        "TEXT:",
+        s.text,
+        "",
+        "IMPORTANT:",
+        "The source may be a directory. Extract specific offers only when the supplied text actually identifies them.",
+      ].join("\n");
+    })
+    .join(
+      "\n\n====================\n\n"
+    );
+
+  return `
+You are the strict Gift Hunter verifier.
+
+Analyze ONLY the supplied source material.
+
+IMPORTANT CHANGE:
+
+Do NOT reject a source merely because the source page does not contain the words "free", "cash", "money", "crypto", or similar.
+
+First discover specific offers from:
+- page text
+- headings
+- metadata
+- discovered links
+- offer-page text
+
+Then inspect the supplied offer-page text when available.
+
+Only after discovering a candidate should the 37 rules be applied.
+
+Never invent information.
+
+For every candidate:
+
+- use the exact URL found in the supplied material;
+- extract title, description, value, type and expiration when explicitly present;
+- identify requirements/terms/FAQ when present;
+- produce exactly one rule result for every supplied rule;
+- PASS requires direct evidence;
+- FAIL requires clear evidence that the prohibited condition exists;
+- UNKNOWN means the evidence is missing, ambiguous, conditional, or contradictory;
+- an UNKNOWN is NOT a pass;
+- any FAIL or UNKNOWN makes the candidate ineligible.
+
+Special requirements:
+
+- Rule 36 requires direct evidence that the reward is monetary or a crypto/digital asset of value.
+- Rule 37 requires direct evidence that the reward is free without payment or the prohibited action.
+- Do not treat an ordinary product discount as free money.
+- Do not treat loyalty points as cash unless the supplied evidence clearly establishes monetary/crypto value.
+- Do not turn a giveaway directory listing into a verified eligible offer without evidence from the supplied text.
+- If the source does not provide enough evidence, return UNKNOWN and reject the candidate.
+- Negative phrases such as "no purchase necessary" must NOT be interpreted as a failure for a purchase rule.
+
+Return ONLY valid JSON:
+
+{
+  "candidates": [
+    {
+      "title": "",
+      "description": "",
+      "value": "",
+      "type": "Financial/Crypto",
+      "expires": "",
+      "url": "",
+      "source": "",
+      "requirements": "",
+      "terms": "",
+      "faq": "",
+      "ruleResults": [
+        {
+          "id": 1,
+          "status": "PASS|FAIL|UNKNOWN",
+          "evidence": ""
+        }
+      ]
+    }
+  ]
+}
+
+RULES:
+${rulesToText(rules)}
+
+SOURCES:
+${sourceText}
 `;
 }
 
-async function askNvidia(env, messages) {
+async function analyzeWithNvidia(
+  sources,
+  rules,
+  env
+) {
   if (!env.NVIDIA_API_KEY) {
     throw new Error(
       "NVIDIA_API_KEY is not configured"
     );
   }
 
-  const res = await fetch(NVIDIA_URL, {
-    method: "POST",
+  const response = await fetch(
+    NVIDIA_URL,
+    {
+      method: "POST",
 
-    headers: {
-      "Authorization":
-        `Bearer ${env.NVIDIA_API_KEY}`,
+      headers: {
+        Authorization:
+          `Bearer ${env.NVIDIA_API_KEY}`,
+        Accept:
+          "application/json",
+        "Content-Type":
+          "application/json",
+      },
 
-      "Accept":
-        "application/json",
+      body: JSON.stringify({
+        model: DEFAULT_MODEL,
 
-      "Content-Type":
-        "application/json"
-    },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a strict evidence-based verifier. Return JSON only.",
+          },
+          {
+            role: "user",
+            content:
+              buildPrompt(
+                sources,
+                rules
+              ),
+          },
+        ],
 
-    body: JSON.stringify({
-      model: DEFAULT_MODEL,
-      messages,
+        max_tokens: 14000,
+        temperature: 0.2,
+        top_p: 0.95,
+        stream: false,
+      }),
+    }
+  );
 
-      max_tokens: 12000,
+  const text =
+    await response.text();
 
-      temperature: 1,
-
-      top_p: 0.95,
-
-      stream: false
-    })
-  });
-
-  const text = await res.text();
+  if (!response.ok) {
+    throw new Error(
+      `NVIDIA HTTP ${response.status}: ${text.slice(
+        0,
+        800
+      )}`
+    );
+  }
 
   let data;
 
   try {
     data = JSON.parse(text);
   } catch {
-    data = {
-      raw: text
-    };
-  }
-
-  if (!res.ok) {
     throw new Error(
-      `NVIDIA HTTP ${res.status}: ${text.slice(0, 1200)}`
+      "NVIDIA returned invalid JSON"
     );
   }
-
-  return data;
-}
-
-function parseModelJson(content) {
-  const cleaned = String(content || "")
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {}
-
-  const first = cleaned.indexOf("{");
-  const last = cleaned.lastIndexOf("}");
-
-  if (first >= 0 && last > first) {
-    try {
-      return JSON.parse(
-        cleaned.slice(first, last + 1)
-      );
-    } catch {}
-  }
-
-  return null;
-}
-
-function validateDecision(parsed) {
-  const byId = new Map(
-    Array.isArray(parsed?.rules)
-      ? parsed.rules.map(x => [
-          Number(x.id),
-          x
-        ])
-      : []
-  );
-
-  const rules = RULES.map(rule => {
-    const x = byId.get(rule.id);
-
-    const status =
-      x?.status === "PASS"
-        ? "PASS"
-        : x?.status === "FAIL"
-        ? "FAIL"
-        : "UNKNOWN";
-
-    return {
-      id: rule.id,
-      name: rule.name,
-      status,
-
-      evidence:
-        cleanText(x?.evidence).slice(0, 500)
-    };
-  });
-
-  const failed =
-    rules.filter(
-      x => x.status === "FAIL"
-    ).length;
-
-  const unknown =
-    rules.filter(
-      x => x.status === "UNKNOWN"
-    ).length;
-
-  const passed =
-    rules.filter(
-      x => x.status === "PASS"
-    ).length;
-
-  return {
-    eligible:
-      passed === 37 &&
-      failed === 0 &&
-      unknown === 0,
-
-    passed,
-    failed,
-    unknown,
-
-    rules,
-
-    reason:
-      passed === 37
-        ? "اجتاز جميع الشروط الـ37"
-        : "رفض: لم يثبت كل شرط من الشروط الـ37"
-  };
-}
-
-function cheapReject(candidate) {
-  const text = cleanText(
-    [
-      candidate.title,
-      candidate.description,
-      candidate.sourceText,
-      candidate.type
-    ].join(" ")
-  );
-
-  if (!MONEY_RE.test(text)) {
-    return {
-      reject: true,
-      reason:
-        "لا يوجد دليل واضح على مكافأة مالية أو رقمية"
-    };
-  }
-
-  if (!FREE_RE.test(text)) {
-    return {
-      reject: true,
-      reason:
-        "لا يوجد تصريح واضح بالمجانية"
-    };
-  }
-
-  return {
-    reject: false
-  };
-}
-
-async function analyzeCandidate(
-  env,
-  candidate
-) {
-  const cheap =
-    cheapReject(candidate);
-
-  if (cheap.reject) {
-    return {
-      eligible: false,
-
-      passed: 0,
-      failed: 0,
-      unknown: 37,
-
-      rules: RULES.map(r => ({
-        id: r.id,
-        name: r.name,
-        status: "UNKNOWN",
-        evidence: cheap.reason
-      })),
-
-      reason: cheap.reason
-    };
-  }
-
-  const data =
-    await askNvidia(env, [
-      {
-        role: "system",
-        content:
-          "أنت محقق صارم. أعد JSON فقط ولا تخمن."
-      },
-
-      {
-        role: "user",
-        content:
-          buildPrompt(candidate)
-      }
-    ]);
 
   const content =
     data?.choices?.[0]?.message?.content ||
     "";
 
-  const parsed =
-    parseModelJson(content);
+  const match =
+    content.match(/\{[\s\S]*\}/);
 
-  if (!parsed) {
+  if (!match) {
     return {
-      eligible: false,
-
-      passed: 0,
-      failed: 0,
-      unknown: 37,
-
-      rules: RULES.map(r => ({
-        id: r.id,
-        name: r.name,
-        status: "UNKNOWN",
-        evidence:
-          "تعذر الحصول على قرار JSON موثوق"
-      })),
-
-      reason:
-        "رفض آمن: تعذر التحقق"
-    };
-  }
-
-  return validateDecision(parsed);
-}
-
-async function scanSource(
-  env,
-  source
-) {
-  try {
-    const page =
-      await fetchText(source.url);
-
-    const candidates =
-      discoverCandidates(
-        page.finalUrl,
-        page.html
-      );
-
-    const results = [];
-
-    for (
-      const candidate of candidates
-    ) {
-      try {
-        let enriched = {
-          ...candidate
-        };
-
-        if (
-          candidate.url &&
-          !sameOrRelatedHost(
-            candidate.url,
-            page.finalUrl
-          )
-        ) {
-          continue;
-        }
-
-        if (
-          candidate.url &&
-          candidate.url !== page.finalUrl
-        ) {
-          try {
-            const offerPage =
-              await fetchText(
-                candidate.url
-              );
-
-            const offerText =
-              stripHtml(
-                offerPage.html
-              ).slice(
-                0,
-                MAX_TEXT
-              );
-
-            enriched = {
-              ...candidate,
-
-              url:
-                offerPage.finalUrl ||
-                candidate.url,
-
-              description:
-                cleanText(
-                  candidate.description
-                ) +
-                " " +
-                offerText.slice(
-                  0,
-                  7000
-                ),
-
-              sourceText:
-                cleanText(
-                  candidate.sourceText
-                ) +
-                " " +
-                offerText
-            };
-          } catch {
-            // نستخدم دليل صفحة المصدر فقط.
-          }
-        }
-
-        const decision =
-          await analyzeCandidate(
-            env,
-            enriched
-          );
-
-        results.push({
-          title:
-            cleanText(
-              enriched.title
-            ),
-
-          description:
-            cleanText(
-              enriched.description
-            ).slice(0, 5000),
-
-          value:
-            extractValue(
-              enriched.sourceText
-            ),
-
-          type:
-            cleanText(
-              enriched.type ||
-              "Financial/Crypto"
-            ),
-
-          expires:
-            "غير محدد",
-
-          url:
-            enriched.url,
-
-          source:
-            source.name,
-
-          ruleResults:
-            decision.rules,
-
-          verification:
-            decision,
-
-          eligible:
-            decision.eligible
-        });
-
-      } catch {
-        // فشل مرشح واحد لا يوقف بقية المصدر.
-      }
-    }
-
-    return {
-      source: source.name,
-      url: source.url,
-
-      candidatesFound:
-        candidates.length,
-
-      candidates:
-        results
-    };
-
-  } catch (error) {
-    return {
-      source: source.name,
-      url: source.url,
-
-      candidatesFound: 0,
-
       candidates: [],
-
-      error:
-        String(error)
+      nvidiaRaw:
+        content.slice(0, 4000),
     };
   }
+
+  let parsed;
+
+  try {
+    parsed =
+      JSON.parse(match[0]);
+  } catch {
+    return {
+      candidates: [],
+      nvidiaRaw:
+        content.slice(0, 4000),
+    };
+  }
+
+  return {
+    candidates:
+      Array.isArray(
+        parsed.candidates
+      )
+        ? parsed.candidates
+        : [],
+  };
 }
 
-function extractValue(text) {
-  const t =
-    cleanText(text);
+function normalizeAndVerify(
+  item,
+  sourceName,
+  rules
+) {
+  if (
+    !item ||
+    typeof item !== "object"
+  ) {
+    return null;
+  }
 
-  const m =
-    t.match(
-      /(?:\$|USD|USDT|USDC|EUR|€|GBP|£)\s?\d+(?:[.,]\d+)?/i
+  const title = cleanText(
+    item.title || item.name
+  );
+
+  const description = cleanText(
+    item.description ||
+      item.details ||
+      item.summary
+  );
+
+  const value = cleanText(
+    item.value ||
+      item.amount ||
+      ""
+  );
+
+  const url = String(
+    item.url ||
+      item.link ||
+      ""
+  ).trim();
+
+  if (
+    !title ||
+    !url ||
+    !/^https?:\/\//i.test(url)
+  ) {
+    return null;
+  }
+
+  const supplied =
+    Array.isArray(
+      item.ruleResults
+    )
+      ? item.ruleResults
+      : [];
+
+  const byId =
+    new Map(
+      supplied.map((r) => [
+        Number(r.id),
+        r,
+      ])
     );
 
-  return m
-    ? m[0]
-    : "";
+  const ruleResults =
+    (
+      Array.isArray(rules)
+        ? rules
+        : []
+    ).map((rule) => {
+      const r =
+        byId.get(
+          Number(rule.id)
+        );
+
+      const status =
+        r?.status === "PASS"
+          ? "PASS"
+          : r?.status === "FAIL"
+            ? "FAIL"
+            : "UNKNOWN";
+
+      return {
+        id: rule.id,
+        name:
+          rule.name || "",
+        status,
+        evidence:
+          cleanText(
+            r?.evidence
+          ).slice(0, 700),
+      };
+    });
+
+  const failed =
+    ruleResults.filter(
+      (r) =>
+        r.status === "FAIL"
+    ).length;
+
+  const unknown =
+    ruleResults.filter(
+      (r) =>
+        r.status === "UNKNOWN"
+    ).length;
+
+  const passed =
+    ruleResults.filter(
+      (r) =>
+        r.status === "PASS"
+    ).length;
+
+  const eligible =
+    ruleResults.length === 37 &&
+    passed === 37 &&
+    failed === 0 &&
+    unknown === 0;
+
+  return {
+    title,
+    description,
+    value,
+
+    type: cleanText(
+      item.type ||
+        "Financial/Crypto"
+    ),
+
+    expires: cleanText(
+      item.expires ||
+        "غير محدد"
+    ),
+
+    url,
+
+    source:
+      cleanText(
+        item.source
+      ) ||
+      sourceName ||
+      "Worker",
+
+    requirements:
+      cleanText(
+        item.requirements
+      ),
+
+    terms:
+      cleanText(
+        item.terms
+      ),
+
+    faq:
+      cleanText(
+        item.faq
+      ),
+
+    verification: {
+      results: ruleResults,
+      passed,
+      failed,
+      unknown,
+      eligible,
+    },
+
+    eligible,
+  };
 }
 
 async function handleScan(
@@ -998,8 +776,7 @@ async function handleScan(
     return json(
       {
         ok: false,
-        error:
-          "Invalid JSON"
+        error: "Invalid JSON",
       },
       400,
       origin
@@ -1009,13 +786,15 @@ async function handleScan(
   if (
     !Array.isArray(
       body?.urls
-    )
+    ) ||
+    body.urls.length === 0 ||
+    body.urls.length > 10
   ) {
     return json(
       {
         ok: false,
         error:
-          "urls must be an array"
+          "urls must contain 1-10 sources",
       },
       400,
       origin
@@ -1023,13 +802,16 @@ async function handleScan(
   }
 
   if (
-    body.urls.length > 12
+    !Array.isArray(
+      body?.rules
+    ) ||
+    body.rules.length !== 37
   ) {
     return json(
       {
         ok: false,
         error:
-          "Maximum 12 sources per scan request"
+          "Exactly 37 rules are required from the application",
       },
       400,
       origin
@@ -1037,83 +819,110 @@ async function handleScan(
   }
 
   const sources =
-    body.urls
-      .map(x => ({
-        name:
-          cleanText(
-            x?.name ||
-            "Source"
-          ),
+    await readSources(
+      body.urls
+    );
 
-        url:
-          String(
-            x?.url || ""
-          ).trim()
-      }))
-      .filter(
-        x =>
-          /^https?:\/\//i.test(
-            x.url
-          )
-      );
-
-  const results = [];
-
-  let totalCandidates = 0;
-
-  for (
-    const source of sources
-  ) {
-    const result =
-      await scanSource(
-        env,
-        source
-      );
-
-    totalCandidates +=
-      result.candidatesFound;
-
-    results.push(
-      result
+  if (!sources.length) {
+    return json(
+      {
+        ok: true,
+        candidates: [],
+        readableSources: 0,
+        discoveredPages: 0,
+      },
+      200,
+      origin
     );
   }
 
-  const candidates =
-    results.flatMap(
-      x =>
-        x.candidates || []
+  try {
+    const result =
+      await analyzeWithNvidia(
+        sources,
+        body.rules,
+        env
+      );
+
+    const normalized = [];
+
+    for (
+      const item of
+      result.candidates || []
+    ) {
+      const candidate =
+        normalizeAndVerify(
+          item,
+          item?.source || "",
+          body.rules
+        );
+
+      if (candidate) {
+        normalized.push(
+          candidate
+        );
+      }
+    }
+
+    /*
+     * طبقة أمان نهائية:
+     * التطبيق لا يستلم إلا العروض
+     * التي اجتازت 37/37.
+     */
+    const eligible =
+      normalized.filter(
+        (x) =>
+          x.eligible === true &&
+          x.verification
+            .passed === 37 &&
+          x.verification
+            .failed === 0 &&
+          x.verification
+            .unknown === 0
+      );
+
+    return json(
+      {
+        ok: true,
+
+        readableSources:
+          sources.length,
+
+        discoveredPages:
+          sources.length,
+
+        candidatesFound:
+          normalized.length,
+
+        eligibleCount:
+          eligible.length,
+
+        candidates:
+          eligible,
+      },
+      200,
+      origin
     );
+  } catch (e) {
+    return json(
+      {
+        ok: false,
+        error:
+          String(e).slice(
+            0,
+            1200
+          ),
 
-  return json(
-    {
-      ok: true,
+        readableSources:
+          sources.length,
 
-      sourcesRequested:
-        sources.length,
-
-      candidatesFound:
-        totalCandidates,
-
-      candidates,
-
-      sourceResults:
-        results.map(x => ({
-          source:
-            x.source,
-
-          url:
-            x.url,
-
-          candidatesFound:
-            x.candidatesFound,
-
-          error:
-            x.error || null
-        }))
-    },
-    200,
-    origin
-  );
+        discoveredPages:
+          sources.length,
+      },
+      502,
+      origin
+    );
+  }
 }
 
 export default {
@@ -1134,11 +943,10 @@ export default {
         null,
         {
           status: 204,
-
           headers:
             corsHeaders(
               origin
-            )
+            ),
         }
       );
     }
@@ -1148,6 +956,9 @@ export default {
         request.url
       );
 
+    /*
+     * اختبار الخادم
+     */
     if (
       request.method ===
         "GET" &&
@@ -1156,21 +967,20 @@ export default {
       return json(
         {
           ok: true,
-
           service:
             "Gift Hunter NVIDIA Proxy",
-
-          status:
-            "online",
-
+          status: "online",
           mode:
-            "source-discovery-and-37-rule-verification"
+            "deep-source-discovery-then-37-rule-verification",
         },
         200,
         origin
       );
     }
 
+    /*
+     * اختبار NVIDIA
+     */
     if (
       request.method ===
         "GET" &&
@@ -1179,32 +989,73 @@ export default {
     ) {
       try {
         const data =
-          await askNvidia(
-            env,
-            [
-              {
-                role: "user",
-                content:
-                  "Reply with exactly: NVIDIA TEST OK"
-              }
-            ]
+          await fetch(
+            NVIDIA_URL,
+            {
+              method: "POST",
+
+              headers: {
+                Authorization:
+                  `Bearer ${env.NVIDIA_API_KEY}`,
+
+                Accept:
+                  "application/json",
+
+                "Content-Type":
+                  "application/json",
+              },
+
+              body:
+                JSON.stringify({
+                  model:
+                    DEFAULT_MODEL,
+
+                  messages: [
+                    {
+                      role: "user",
+                      content:
+                        "Reply with exactly: NVIDIA TEST OK",
+                    },
+                  ],
+
+                  max_tokens: 100,
+                  temperature: 0,
+                  stream: false,
+                }),
+            }
           );
+
+        const text =
+          await data.text();
+
+        let result;
+
+        try {
+          result =
+            JSON.parse(
+              text
+            );
+        } catch {
+          result = {
+            raw: text,
+          };
+        }
 
         return json(
           {
-            ok: true,
-            nvidia: data
+            ok: data.ok,
+            nvidia:
+              result,
           },
-          200,
+          data.status,
           origin
         );
-
-      } catch (error) {
+      } catch (e) {
         return json(
           {
             ok: false,
             error:
-              String(error)
+              String(e),
           },
           502,
           origin
@@ -1212,6 +1063,9 @@ export default {
       }
     }
 
+    /*
+     * البحث العميق
+     */
     if (
       request.method ===
         "POST" &&
@@ -1225,12 +1079,29 @@ export default {
       );
     }
 
+    /*
+     * اتصال NVIDIA مباشر
+     */
     if (
       request.method ===
         "POST" &&
       url.pathname ===
         "/nvidia"
     ) {
+      if (
+        !env.NVIDIA_API_KEY
+      ) {
+        return json(
+          {
+            ok: false,
+            error:
+              "NVIDIA_API_KEY is not configured",
+          },
+          500,
+          origin
+        );
+      }
+
       let body;
 
       try {
@@ -1241,7 +1112,7 @@ export default {
           {
             ok: false,
             error:
-              "Invalid JSON"
+              "Invalid JSON request",
           },
           400,
           origin
@@ -1257,7 +1128,7 @@ export default {
           {
             ok: false,
             error:
-              "messages must be an array"
+              "messages must be an array",
           },
           400,
           origin
@@ -1265,28 +1136,71 @@ export default {
       }
 
       try {
-        const data =
-          await askNvidia(
-            env,
-            body.messages
+        const response =
+          await fetch(
+            NVIDIA_URL,
+            {
+              method: "POST",
+
+              headers: {
+                Authorization:
+                  `Bearer ${env.NVIDIA_API_KEY}`,
+
+                Accept:
+                  "application/json",
+
+                "Content-Type":
+                  "application/json",
+              },
+
+              body:
+                JSON.stringify({
+                  ...body,
+
+                  model:
+                    body.model ||
+                    DEFAULT_MODEL,
+
+                  stream: false,
+                }),
+            }
           );
+
+        const text =
+          await response.text();
+
+        let data;
+
+        try {
+          data =
+            JSON.parse(
+              text
+            );
+        } catch {
+          data = {
+            raw: text,
+          };
+        }
 
         return json(
           {
-            ok: true,
-            status: 200,
-            data
+            ok:
+              response.ok,
+
+            status:
+              response.status,
+
+            data,
           },
-          200,
+          response.status,
           origin
         );
-
-      } catch (error) {
+      } catch (e) {
         return json(
           {
             ok: false,
             error:
-              String(error)
+              String(e),
           },
           502,
           origin
@@ -1298,10 +1212,10 @@ export default {
       {
         ok: false,
         error:
-          "Endpoint not found"
+          "Endpoint not found",
       },
       404,
       origin
     );
-  }
+  },
 };
