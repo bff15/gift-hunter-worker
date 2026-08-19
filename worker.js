@@ -3,77 +3,28 @@ const NVIDIA_URL =
 
 const DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b";
 
-// نفس ترتيب الشروط المستخدم في Gift Hunter.
-const RULES = [
-  {id:1,name:"لا يوجد شراء أو طلب مدفوع"},
-  {id:2,name:"لا يوجد إيداع"},
-  {id:3,name:"لا توجد رسوم أو عمولة"},
-  {id:4,name:"لا يوجد اشتراك مدفوع"},
-  {id:5,name:"لا توجد بطاقة دفع"},
-  {id:6,name:"لا يلزم تثبيت تطبيق"},
-  {id:7,name:"لا يلزم تنزيل لعبة"},
-  {id:8,name:"لا يلزم امتلاك لعبة"},
-  {id:9,name:"لا يلزم تسجيل الدخول"},
-  {id:10,name:"لا يلزم إنشاء حساب"},
-  {id:11,name:"لا يلزم تأكيد البريد"},
-  {id:12,name:"لا يلزم رقم هاتف"},
-  {id:13,name:"لا توجد CAPTCHA إلزامية"},
-  {id:14,name:"لا يوجد KYC"},
-  {id:15,name:"لا يلزم إثبات هوية"},
-  {id:16,name:"لا يلزم جواز سفر أو وثائق"},
-  {id:17,name:"لا يلزم رفع مستندات"},
-  {id:18,name:"لا يلزم ربط محفظة"},
-  {id:19,name:"لا يلزم توقيع رسالة"},
-  {id:20,name:"لا توجد معاملة بلوكشين مطلوبة"},
-  {id:21,name:"لا توجد إحالة مطلوبة"},
-  {id:22,name:"لا يلزم دعوة أصدقاء"},
-  {id:23,name:"لا يلزم متابعة حساب"},
-  {id:24,name:"لا يلزم إعجاب"},
-  {id:25,name:"لا يلزم مشاركة"},
-  {id:26,name:"لا يلزم تعليق"},
-  {id:27,name:"لا يلزم اشتراك بقناة"},
-  {id:28,name:"لا يوجد استطلاع"},
-  {id:29,name:"لا توجد مشاهدة فيديو إلزامية"},
-  {id:30,name:"لا توجد إعلانات أو مشاهدة إعلانات"},
-  {id:31,name:"لا توجد مهام إلزامية"},
-  {id:32,name:"لا يعتمد على نقاط"},
-  {id:33,name:"لا يعتمد على رصيد نقاط"},
-  {id:34,name:"لا يعتمد على XP أو نظام تقدم"},
-  {id:35,name:"المكافأة ليست لعبة أو عنصرًا غير مالي"},
-  {id:36,name:"المكافأة مالية أو رقمية ذات قيمة"},
-  {id:37,name:"يوجد تصريح صريح بأن المكافأة مجانية دون مقابل"}
-];
-
-const MAX_SOURCE_BYTES = 900000;
-const MAX_TEXT = 28000;
-const MAX_CANDIDATES_PER_SOURCE = 3;
+const MAX_SOURCE_TEXT = 14000;
+const MAX_PAGE_TEXT = 9000;
+const MAX_DISCOVERED_LINKS = 35;
+const MAX_OFFER_PAGES = 4;
 const FETCH_TIMEOUT = 12000;
-
-const MONEY_RE =
-  /\b(?:cash|money|usd|dollar|eur|euro|gbp|prize|cash prize|gift card|crypto|cryptocurrency|token|coin|airdrop|usdt|usdc|btc|bitcoin|ethereum|eth|sol|solana|reward)\b|(?:نقد|مال|جائزة مالية|بطاقة هدية|عملة رقمية|توكن|عملة|إيردروب|مكافأة)/i;
-
-const FREE_RE =
-  /\b(?:free|completely free|100% free|no purchase necessary|no purchase required|free to enter|free entry)\b|(?:مجاني|مجانا|مجاناً|دون شراء|لا يلزم شراء|بدون شراء)/i;
-
-const NEGATIVE_RE =
-  /\b(?:purchase|buy|order|deposit|fee|gas|network fee|subscription fee|credit card|debit card|install|download app|download game|login|sign in|signup|sign-up|register|email verification|verify email|phone|sms|otp|captcha|recaptcha|hcaptcha|kyc|identity verification|passport|document upload|connect wallet|sign message|transaction|referral|refer a friend|invite friends|follow|like|share|comment|subscribe|survey|watch video|watch ads|advertisement|complete tasks|points|credits|xp)\b|(?:شراء|دفع|إيداع|رسوم|عمولة|اشتراك مدفوع|بطاقة ائتمان|تثبيت|تنزيل|تسجيل الدخول|إنشاء حساب|تأكيد البريد|رقم الهاتف|رسالة نصية|رمز|كابتشا|إثبات الهوية|جواز|رفع وثائق|ربط المحفظة|توقيع|معاملة|إحالة|دعوة أصدقاء|متابعة|إعجاب|مشاركة|تعليق|اشتراك|استطلاع|مشاهدة فيديو|إعلانات|مهام|نقاط|رصيد|خبرة)/i;
 
 function corsHeaders(origin = "*") {
   return {
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400",
   };
 }
 
 function json(data, status = 200, origin = "*") {
-  return new Response(JSON.stringify(data, null, 2), {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(origin)
-    }
+      ...corsHeaders(origin),
+    },
   });
 }
 
@@ -93,17 +44,125 @@ function stripHtml(html) {
       .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
       .replace(/<!--[\s\S]*?-->/g, " ")
       .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
   );
 }
 
-function decodeHtml(s) {
-  return String(s || "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
+function hostAllowed(hostname) {
+  return (
+    hostname &&
+    !/^(localhost|127\.0\.0\.1|0\.0\.0\.0)$/i.test(hostname)
+  );
+}
+
+function absoluteUrl(base, href) {
+  try {
+    return new URL(href, base).href;
+  } catch {
+    return "";
+  }
+}
+
+function sameHost(a, b) {
+  try {
+    return (
+      new URL(a).hostname.replace(/^www\./i, "") ===
+      new URL(b).hostname.replace(/^www\./i, "")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function titleFromUrl(url) {
+  try {
+    const p =
+      new URL(url).pathname.split("/").filter(Boolean).pop() || "";
+
+    return decodeURIComponent(p)
+      .replace(/\.(html?|php|aspx?)$/i, "")
+      .replace(/[-_]+/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+      .slice(0, 180);
+  } catch {
+    return "";
+  }
+}
+
+function isUsefulLink(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return false;
+
+  return (
+    !/\.(jpg|jpeg|png|gif|svg|webp|ico|css|js|xml|zip|rar|mp4|mp3|pdf)(?:[?#]|$)/i.test(
+      url
+    ) &&
+    !/(\/login|\/signin|\/sign-in|\/signup|\/sign-up|\/register|\/account|\/cart|\/checkout|\/privacy|\/terms|\/cookie)/i.test(
+      url
+    )
+  );
+}
+
+function linkScore(text, url) {
+  const t = `${text} ${url}`.toLowerCase();
+
+  let score = 0;
+
+  if (
+    /(giveaway|contest|sweepstake|prize|reward|bonus|airdrop|claim|freebie|free|cash|money|crypto|token|coin|gift card)/i.test(
+      t
+    )
+  ) {
+    score += 6;
+  }
+
+  if (/(offer|promo|promotion|win|winner|earn|claim|drop)/i.test(t)) {
+    score += 3;
+  }
+
+  if (/(buy|purchase|subscription|deposit|fee|referral|invite|survey|points)/i.test(t)) {
+    score -= 1;
+  }
+
+  if (text && text.length >= 8) score += 1;
+
+  return score;
+}
+
+function extractLinks(html, baseUrl) {
+  const found = [];
+  const re =
+    /<a\b([^>]*?)href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+  let m;
+
+  while ((m = re.exec(html))) {
+    const url = absoluteUrl(baseUrl, m[2]);
+
+    if (!isUsefulLink(url)) continue;
+
+    const text = stripHtml(m[3]).slice(0, 300);
+    const score = linkScore(text, url);
+
+    found.push({
+      url,
+      text,
+      score,
+    });
+  }
+
+  const seen = new Set();
+
+  return found
+    .sort((a, b) => b.score - a.score)
+    .filter((x) => {
+      const key = x.url.split("#")[0];
+
+      if (seen.has(key))    .replace(/&gt;/gi, ">");
 }
 
 function absoluteUrl(base, href) {
