@@ -1,1 +1,4 @@
-
+name = "wispy-queen-48a3"
+main = "worker.js"
+compatibility_date = "2026-08-19"
+workers_dev = true
