@@ -1,19 +1,19 @@
 const NVIDIA_URL =
   "https://integrate.api.nvidia.com/v1/chat/completions";
 
-const DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b";
+const DEFAULT_MODEL =
+  "nvidia/nemotron-3-super-120b-a12b";
 
-const MAX_SOURCE_TEXT = 14000;
-const MAX_PAGE_TEXT = 9000;
-const MAX_DISCOVERED_LINKS = 35;
-const MAX_OFFER_PAGES = 4;
-const FETCH_TIMEOUT = 12000;
+const MAX_SOURCE_CHARS = 12000;
+const MAX_TOTAL_CHARS = 50000;
+const MAX_LINKS_PER_SOURCE = 12;
 
 function corsHeaders(origin = "*") {
   return {
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -28,472 +28,275 @@ function json(data, status = 200, origin = "*") {
   });
 }
 
-function cleanText(value) {
-  return String(value ?? "")
-    .replace(/\u0000/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+/* -------------------------------------------------------
+   تنظيف HTML وتحويله إلى نص قابل للتحليل
+------------------------------------------------------- */
+
+function decodeHtml(text) {
+  return String(text || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
 }
 
 function stripHtml(html) {
-  return cleanText(
+  return decodeHtml(
     String(html || "")
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
-      .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
-      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(
+        /<script[\s\S]*?<\/script>/gi,
+        " "
+      )
+      .replace(
+        /<style[\s\S]*?<\/style>/gi,
+        " "
+      )
+      .replace(
+        /<noscript[\s\S]*?<\/noscript>/gi,
+        " "
+      )
+      .replace(
+        /<svg[\s\S]*?<\/svg>/gi,
+        " "
+      )
+      .replace(
+        /<iframe[\s\S]*?<\/iframe>/gi,
+        " "
+      )
       .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&quot;/gi, '"')
-      .replace(/&#39;|&apos;/gi, "'")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
+      .replace(/\s+/g, " ")
+      .trim()
   );
 }
 
-function hostAllowed(hostname) {
-  return (
-    hostname &&
-    !/^(localhost|127\.0\.0\.1|0\.0\.0\.0)$/i.test(hostname)
-  );
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\u0000/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
 }
 
-function absoluteUrl(base, href) {
-  try {
-    return new URL(href, base).href;
-  } catch {
-    return "";
-  }
-}
+/* -------------------------------------------------------
+   حماية بسيطة من SSRF
+------------------------------------------------------- */
 
-function sameHost(a, b) {
-  try {
-    return (
-      new URL(a).hostname.replace(/^www\./i, "") ===
-      new URL(b).hostname.replace(/^www\./i, "")
-    );
-  } catch {
-    return false;
-  }
-}
-
-function titleFromUrl(url) {
-  try {
-    const p =
-      new URL(url).pathname.split("/").filter(Boolean).pop() || "";
-
-    return decodeURIComponent(p)
-      .replace(/\.(html?|php|aspx?)$/i, "")
-      .replace(/[-_]+/g, " ")
-      .replace(/\b\w/g, (c) => c.toUpperCase())
-      .slice(0, 180);
-  } catch {
-    return "";
-  }
-}
-
-function isUsefulLink(url) {
-  if (!url || !/^https?:\/\//i.test(url)) return false;
-
-  return (
-    !/\.(jpg|jpeg|png|gif|svg|webp|ico|css|js|xml|zip|rar|mp4|mp3|pdf)(?:[?#]|$)/i.test(
-      url
-    ) &&
-    !/(\/login|\/signin|\/sign-in|\/signup|\/sign-up|\/register|\/account|\/cart|\/checkout|\/privacy|\/terms|\/cookie)/i.test(
-      url
-    )
-  );
-}
-
-function linkScore(text, url) {
-  const t = `${text} ${url}`.toLowerCase();
-
-  let score = 0;
+function validHostname(hostname) {
+  if (!hostname) return false;
 
   if (
-    /(giveaway|contest|sweepstake|prize|reward|bonus|airdrop|claim|freebie|free|cash|money|crypto|token|coin|gift card)/i.test(
-      t
+    /^(localhost|127\.0\.0\.1|0\.0\.0\.0)$/i.test(
+      hostname
     )
   ) {
-    score += 6;
+    return false;
   }
 
-  if (/(offer|promo|promotion|win|winner|earn|claim|drop)/i.test(t)) {
-    score += 3;
+  if (
+    hostname === "::1" ||
+    hostname.endsWith(".local")
+  ) {
+    return false;
   }
 
-  if (/(buy|purchase|subscription|deposit|fee|referral|invite|survey|points)/i.test(t)) {
-    score -= 1;
-  }
-
-  if (text && text.length >= 8) score += 1;
-
-  return score;
+  return true;
 }
+
+/* -------------------------------------------------------
+   قراءة المصدر
+------------------------------------------------------- */
+
+async function fetchText(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 Gift-Hunter/2.0",
+      "Accept":
+        "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+      "Accept-Language":
+        "en-US,en;q=0.9",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status}`
+    );
+  }
+
+  const type =
+    response.headers.get("content-type") || "";
+
+  const raw = await response.text();
+
+  let text;
+
+  if (/json/i.test(type)) {
+    text = raw;
+  } else {
+    text = stripHtml(raw);
+  }
+
+  return cleanText(text);
+}
+
+/* -------------------------------------------------------
+   استخراج الروابط من الصفحة
+------------------------------------------------------- */
 
 function extractLinks(html, baseUrl) {
-  const found = [];
-  const re =
-    /<a\b([^>]*?)href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const links = [];
 
-  let m;
+  const regex =
+    /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>/gi;
 
-  while ((m = re.exec(html))) {
-    const url = absoluteUrl(baseUrl, m[2]);
+  let match;
 
-    if (!isUsefulLink(url)) continue;
+  while (
+    (match = regex.exec(html)) !== null &&
+    links.length < MAX_LINKS_PER_SOURCE
+  ) {
+    try {
+      const absolute =
+        new URL(match[1], baseUrl);
 
-    const text = stripHtml(m[3]).slice(0, 300);
-    const score = linkScore(text, url);
-
-    found.push({
-      url,
-      text,
-      score,
-    });
+      if (
+        absolute.protocol === "https:" &&
+        validHostname(absolute.hostname)
+      ) {
+        links.push(absolute.toString());
+      }
+    } catch {}
   }
 
-  const seen = new Set();
-
-  return found
-    .sort((a, b) => b.score - a.score)
-    .filter((x) => {
-      const key = x.url.split("#")[0];
-
-      if (seen.has(key)) return false;
-
-      seen.add(key);
-      return true;
-    })
-    .slice(0, MAX_DISCOVERED_LINKS);
+  return [...new Set(links)];
 }
 
-function extractMeta(html) {
-  const result = {};
+/* -------------------------------------------------------
+   قراءة مصدر مع محاولة العثور على صفحات الشروط
+------------------------------------------------------- */
 
-  const re =
-    /<meta\b[^>]*(?:name|property)\s*=\s*["']([^"']+)["'][^>]*content\s*=\s*["']([^"']*)["'][^>]*>/gi;
+async function readSource(item) {
+  const originalUrl = new URL(item.url);
 
-  let m;
-
-  while ((m = re.exec(html))) {
-    const key = m[1].toLowerCase();
-
-    if (
-      key === "og:title" ||
-      key === "og:description" ||
-      key === "description" ||
-      key === "twitter:title" ||
-      key === "twitter:description"
-    ) {
-      result[key] = cleanText(m[2]);
-    }
+  if (
+    originalUrl.protocol !== "https:" ||
+    !validHostname(originalUrl.hostname)
+  ) {
+    throw new Error("Invalid source URL");
   }
 
-  return result;
-}
-
-async function fetchPage(url) {
-  const controller = new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    FETCH_TIMEOUT
-  );
-
-  try {
-    const u = new URL(url);
-
-    if (
-      u.protocol !== "https:" ||
-      !hostAllowed(u.hostname)
-    ) {
-      throw new Error("Invalid source URL");
-    }
-
-    const response = await fetch(u.toString(), {
+  const response = await fetch(
+    originalUrl.toString(),
+    {
       method: "GET",
       redirect: "follow",
-      signal: controller.signal,
-
       headers: {
         "User-Agent":
-          "Gift-Hunter/2.0 source-reader",
+          "Mozilla/5.0 Gift-Hunter/2.0",
         "Accept":
-          "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8",
+          "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+        "Accept-Language":
+          "en-US,en;q=0.9",
       },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
     }
-
-    const type =
-      response.headers.get("content-type") || "";
-
-    const raw = await response.text();
-
-    const text = /json/i.test(type)
-      ? cleanText(raw)
-      : stripHtml(raw);
-
-    return {
-      requestedUrl: url,
-      finalUrl: response.url || url,
-      contentType: type,
-      raw: raw.slice(0, 700000),
-      text: text.slice(0, MAX_PAGE_TEXT),
-      meta: /json/i.test(type)
-        ? {}
-        : extractMeta(raw),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function buildSourcePackage(page) {
-  const links = extractLinks(
-    page.raw,
-    page.finalUrl
   );
 
-  const linkText = links
-    .map(
-      (x, i) =>
-        `${i + 1}. ${
-          x.text || titleFromUrl(x.url)
-        } | ${x.url}`
-    )
-    .join("\n");
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status}`
+    );
+  }
+
+  const type =
+    response.headers.get("content-type") || "";
+
+  const raw = await response.text();
+
+  let text;
+
+  if (/json/i.test(type)) {
+    text = raw;
+  } else {
+    text = stripHtml(raw);
+  }
+
+  text = cleanText(text);
+
+  if (!text || text.length < 80) {
+    throw new Error("Source has insufficient readable text");
+  }
+
+  /*
+    نبحث عن روابط مهمة داخل الصفحة.
+    لا نعتبرها دليلًا بحد ذاتها؛ فقط نحاول قراءة
+    صفحة الشروط/القواعد إذا كانت واضحة.
+  */
+
+  const discoveredLinks =
+    /html/i.test(type)
+      ? extractLinks(raw, originalUrl.toString())
+      : [];
+
+  const usefulLinks =
+    discoveredLinks.filter((link) =>
+      /(terms|rules|official|giveaway|contest|sweepstake|airdrop|reward|eligib|faq|condition)/i.test(
+        link
+      )
+    ).slice(0, 4);
+
+  const extraTexts = [];
+
+  for (const link of usefulLinks) {
+    try {
+      const extra =
+        await fetchText(link);
+
+      if (extra && extra.length >= 80) {
+        extraTexts.push(
+          `\n\n--- RELATED PAGE ---\nURL: ${link}\n${extra.slice(
+            0,
+            5000
+          )}`
+        );
+      }
+    } catch {}
+  }
+
+  const combined =
+    cleanText(
+      text.slice(0, MAX_SOURCE_CHARS) +
+      extraTexts.join("")
+    );
 
   return {
-    name: page.finalUrl,
-    url: page.finalUrl,
+    name:
+      item.name ||
+      originalUrl.hostname,
 
-    text: [
-      "PAGE TEXT:",
-      page.text,
-      "",
-      "META:",
-      JSON.stringify(page.meta),
-      "",
-      "DISCOVERED LINKS:",
-      linkText,
-    ]
-      .join("\n")
-      .slice(0, MAX_SOURCE_TEXT),
+    url: originalUrl.toString(),
 
-    links,
+    text: combined.slice(
+      0,
+      MAX_SOURCE_CHARS + 18000
+    ),
+
+    discoveredPages:
+      usefulLinks.length,
   };
 }
 
-function selectOfferLinks(source) {
-  return source.links
-    .filter((x) =>
-      sameHost(x.url, source.url)
-    )
-    .filter((x) => x.score >= 3)
-    .slice(0, MAX_OFFER_PAGES);
-}
+/* -------------------------------------------------------
+   NVIDIA
+------------------------------------------------------- */
 
-async function readSources(items) {
-  const sources = [];
-
-  for (const item of items) {
-    try {
-      const page = await fetchPage(
-        String(item.url || "").trim()
-      );
-
-      const source =
-        buildSourcePackage(page);
-
-      source.name =
-        item.name ||
-        new URL(page.finalUrl).hostname;
-
-      sources.push(source);
-
-      const offerLinks =
-        selectOfferLinks(source);
-
-      for (const link of offerLinks) {
-        if (
-          sources.length >=
-          items.length + MAX_OFFER_PAGES
-        ) {
-          break;
-        }
-
-        try {
-          const offerPage =
-            await fetchPage(link.url);
-
-          sources.push({
-            name: source.name,
-            url: offerPage.finalUrl,
-
-            text: [
-              `SOURCE PAGE: ${source.url}`,
-              `OFFER PAGE: ${offerPage.finalUrl}`,
-              "",
-              "OFFER PAGE TEXT:",
-              offerPage.text,
-              "",
-              "OFFER META:",
-              JSON.stringify(
-                offerPage.meta
-              ),
-            ]
-              .join("\n")
-              .slice(0, MAX_SOURCE_TEXT),
-
-            links: [],
-            discoveredFrom: source.url,
-          });
-        } catch {
-          // فشل الصفحة الفرعية لا يوقف المصدر.
-        }
-      }
-    } catch {
-      // فشل مصدر واحد لا يوقف الدفعة.
-    }
-  }
-
-  return sources;
-}
-
-function rulesToText(rules) {
-  if (
-    !Array.isArray(rules) ||
-    !rules.length
-  ) {
-    return (
-      "The application supplied no rule definitions. " +
-      "Do not invent missing rules."
-    );
-  }
-
-  return rules
-    .map((r) => {
-      return [
-        `RULE ${r.id}: ${r.name || ""}`,
-        `Forbidden indicators: ${
-          (r.bad || []).join(", ")
-        }`,
-        `Required positive evidence: ${
-          (r.good || []).join(", ")
-        }`,
-      ].join("\n");
-    })
-    .join("\n\n");
-}
-
-function buildPrompt(sources, rules) {
-  const sourceText = sources
-    .map((s, i) => {
-      return [
-        `SOURCE ${i + 1}`,
-        `NAME: ${s.name}`,
-        `URL: ${s.url}`,
-        "TEXT:",
-        s.text,
-        "",
-        "IMPORTANT:",
-        "The source may be a directory. Extract specific offers only when the supplied text actually identifies them.",
-      ].join("\n");
-    })
-    .join(
-      "\n\n====================\n\n"
-    );
-
-  return `
-You are the strict Gift Hunter verifier.
-
-Analyze ONLY the supplied source material.
-
-IMPORTANT CHANGE:
-
-Do NOT reject a source merely because the source page does not contain the words "free", "cash", "money", "crypto", or similar.
-
-First discover specific offers from:
-- page text
-- headings
-- metadata
-- discovered links
-- offer-page text
-
-Then inspect the supplied offer-page text when available.
-
-Only after discovering a candidate should the 37 rules be applied.
-
-Never invent information.
-
-For every candidate:
-
-- use the exact URL found in the supplied material;
-- extract title, description, value, type and expiration when explicitly present;
-- identify requirements/terms/FAQ when present;
-- produce exactly one rule result for every supplied rule;
-- PASS requires direct evidence;
-- FAIL requires clear evidence that the prohibited condition exists;
-- UNKNOWN means the evidence is missing, ambiguous, conditional, or contradictory;
-- an UNKNOWN is NOT a pass;
-- any FAIL or UNKNOWN makes the candidate ineligible.
-
-Special requirements:
-
-- Rule 36 requires direct evidence that the reward is monetary or a crypto/digital asset of value.
-- Rule 37 requires direct evidence that the reward is free without payment or the prohibited action.
-- Do not treat an ordinary product discount as free money.
-- Do not treat loyalty points as cash unless the supplied evidence clearly establishes monetary/crypto value.
-- Do not turn a giveaway directory listing into a verified eligible offer without evidence from the supplied text.
-- If the source does not provide enough evidence, return UNKNOWN and reject the candidate.
-- Negative phrases such as "no purchase necessary" must NOT be interpreted as a failure for a purchase rule.
-
-Return ONLY valid JSON:
-
-{
-  "candidates": [
-    {
-      "title": "",
-      "description": "",
-      "value": "",
-      "type": "Financial/Crypto",
-      "expires": "",
-      "url": "",
-      "source": "",
-      "requirements": "",
-      "terms": "",
-      "faq": "",
-      "ruleResults": [
-        {
-          "id": 1,
-          "status": "PASS|FAIL|UNKNOWN",
-          "evidence": ""
-        }
-      ]
-    }
-  ]
-}
-
-RULES:
-${rulesToText(rules)}
-
-SOURCES:
-${sourceText}
-`;
-}
-
-async function analyzeWithNvidia(
-  sources,
-  rules,
-  env
-) {
-  if (!env.NVIDIA_API_KEY) {
+async function askNvidia(messages, options = {}) {
+  if (!options.apiKey) {
     throw new Error(
       "NVIDIA_API_KEY is not configured"
     );
@@ -506,7 +309,7 @@ async function analyzeWithNvidia(
 
       headers: {
         Authorization:
-          `Bearer ${env.NVIDIA_API_KEY}`,
+          `Bearer ${options.apiKey}`,
         Accept:
           "application/json",
         "Content-Type":
@@ -514,27 +317,21 @@ async function analyzeWithNvidia(
       },
 
       body: JSON.stringify({
-        model: DEFAULT_MODEL,
+        model:
+          options.model ||
+          DEFAULT_MODEL,
 
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a strict evidence-based verifier. Return JSON only.",
-          },
-          {
-            role: "user",
-            content:
-              buildPrompt(
-                sources,
-                rules
-              ),
-          },
-        ],
+        messages,
 
-        max_tokens: 14000,
-        temperature: 0.2,
-        top_p: 0.95,
+        max_tokens:
+          options.maxTokens || 12000,
+
+        temperature:
+          options.temperature ?? 0,
+
+        top_p:
+          options.topP ?? 1,
+
         stream: false,
       }),
     }
@@ -566,207 +363,582 @@ async function analyzeWithNvidia(
     data?.choices?.[0]?.message?.content ||
     "";
 
-  const match =
-    content.match(/\{[\s\S]*\}/);
-
-  if (!match) {
-    return {
-      candidates: [],
-      nvidiaRaw:
-        content.slice(0, 4000),
-    };
-  }
-
-  let parsed;
-
-  try {
-    parsed =
-      JSON.parse(match[0]);
-  } catch {
-    return {
-      candidates: [],
-      nvidiaRaw:
-        content.slice(0, 4000),
-    };
-  }
-
   return {
-    candidates:
-      Array.isArray(
-        parsed.candidates
-      )
-        ? parsed.candidates
-        : [],
+    data,
+    content: String(content),
   };
 }
 
-function normalizeAndVerify(
-  item,
-  sourceName,
+/* -------------------------------------------------------
+   استخراج JSON من رد NVIDIA
+------------------------------------------------------- */
+
+function parseJsonResponse(content) {
+  let text = String(content || "")
+    .trim();
+
+  text = text
+    .replace(/^```json/i, "")
+    .replace(/^```/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const first =
+    text.indexOf("{");
+
+  const last =
+    text.lastIndexOf("}");
+
+  if (
+    first >= 0 &&
+    last > first
+  ) {
+    try {
+      return JSON.parse(
+        text.slice(first, last + 1)
+      );
+    } catch {}
+  }
+
+  return {
+    candidates: [],
+  };
+}
+
+/* -------------------------------------------------------
+   بناء قائمة الشروط
+------------------------------------------------------- */
+
+function buildRules(rules) {
+  if (!Array.isArray(rules)) {
+    return [];
+  }
+
+  return rules.map((r, index) => ({
+    id:
+      Number.isFinite(Number(r.id))
+        ? Number(r.id)
+        : index + 1,
+
+    name:
+      String(r.name || ""),
+
+    bad:
+      Array.isArray(r.bad)
+        ? r.bad.map(String)
+        : [],
+
+    good:
+      Array.isArray(r.good)
+        ? r.good.map(String)
+        : [],
+  }));
+}
+
+/* -------------------------------------------------------
+   فحص أن النتيجة تحتوي على 37 شرطًا فعلًا
+------------------------------------------------------- */
+
+function verifyRuleResults(
+  candidate,
   rules
 ) {
-  if (
-    !item ||
-    typeof item !== "object"
-  ) {
-    return null;
-  }
-
-  const title = cleanText(
-    item.title || item.name
-  );
-
-  const description = cleanText(
-    item.description ||
-      item.details ||
-      item.summary
-  );
-
-  const value = cleanText(
-    item.value ||
-      item.amount ||
-      ""
-  );
-
-  const url = String(
-    item.url ||
-      item.link ||
-      ""
-  ).trim();
-
-  if (
-    !title ||
-    !url ||
-    !/^https?:\/\//i.test(url)
-  ) {
-    return null;
-  }
-
-  const supplied =
+  const results =
     Array.isArray(
-      item.ruleResults
+      candidate?.ruleResults
     )
-      ? item.ruleResults
+      ? candidate.ruleResults
       : [];
 
-  const byId =
-    new Map(
-      supplied.map((r) => [
-        Number(r.id),
-        r,
-      ])
-    );
+  const byId = new Map();
 
-  const ruleResults =
-    (
-      Array.isArray(rules)
-        ? rules
-        : []
-    ).map((rule) => {
-      const r =
-        byId.get(
-          Number(rule.id)
-        );
+  for (const r of results) {
+    const id = Number(r?.id);
 
-      const status =
-        r?.status === "PASS"
-          ? "PASS"
-          : r?.status === "FAIL"
-            ? "FAIL"
-            : "UNKNOWN";
+    if (!Number.isFinite(id)) {
+      continue;
+    }
 
-      return {
+    if (!byId.has(id)) {
+      byId.set(id, r);
+    }
+  }
+
+  const normalized = [];
+
+  for (const rule of rules) {
+    const r = byId.get(rule.id);
+
+    if (!r) {
+      normalized.push({
         id: rule.id,
-        name:
-          rule.name || "",
-        status,
-        evidence:
-          cleanText(
-            r?.evidence
-          ).slice(0, 700),
-      };
+        status: "UNKNOWN",
+        evidence: "",
+      });
+
+      continue;
+    }
+
+    const status =
+      String(r.status || "")
+        .toUpperCase();
+
+    let safeStatus =
+      "UNKNOWN";
+
+    if (
+      status === "PASS" ||
+      status === "FAIL"
+    ) {
+      safeStatus = status;
+    }
+
+    normalized.push({
+      id: rule.id,
+      status: safeStatus,
+      evidence:
+        String(r.evidence || "")
+          .slice(0, 800),
     });
+  }
+
+  const passed =
+    normalized.filter(
+      x => x.status === "PASS"
+    ).length;
 
   const failed =
-    ruleResults.filter(
-      (r) =>
-        r.status === "FAIL"
+    normalized.filter(
+      x => x.status === "FAIL"
     ).length;
 
   const unknown =
-    ruleResults.filter(
-      (r) =>
-        r.status === "UNKNOWN"
+    normalized.filter(
+      x => x.status === "UNKNOWN"
     ).length;
-
-  const passed =
-    ruleResults.filter(
-      (r) =>
-        r.status === "PASS"
-    ).length;
-
-  const eligible =
-    ruleResults.length === 37 &&
-    passed === 37 &&
-    failed === 0 &&
-    unknown === 0;
 
   return {
-    title,
-    description,
-    value,
+    rules: normalized,
+    passed,
+    failed,
+    unknown,
 
-    type: cleanText(
-      item.type ||
-        "Financial/Crypto"
-    ),
-
-    expires: cleanText(
-      item.expires ||
-        "غير محدد"
-    ),
-
-    url,
-
-    source:
-      cleanText(
-        item.source
-      ) ||
-      sourceName ||
-      "Worker",
-
-    requirements:
-      cleanText(
-        item.requirements
-      ),
-
-    terms:
-      cleanText(
-        item.terms
-      ),
-
-    faq:
-      cleanText(
-        item.faq
-      ),
-
-    verification: {
-      results: ruleResults,
-      passed,
-      failed,
-      unknown,
-      eligible,
-    },
-
-    eligible,
+    eligible:
+      normalized.length === 37 &&
+      passed === 37 &&
+      failed === 0 &&
+      unknown === 0,
   };
 }
+
+/* -------------------------------------------------------
+   طبقة أمان إضافية:
+   لا نقبل نتيجة بلا دليل نصي حقيقي.
+------------------------------------------------------- */
+
+function evidenceIsValid(
+  ruleResults
+) {
+  if (!Array.isArray(ruleResults)) {
+    return false;
+  }
+
+  for (const rule of ruleResults) {
+    if (
+      rule.status === "PASS" &&
+      !String(
+        rule.evidence || ""
+      ).trim()
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/* -------------------------------------------------------
+   تحليل أولي: استخراج العروض فقط
+------------------------------------------------------- */
+
+async function discoverCandidates(
+  sources,
+  rules,
+  env
+) {
+  const ruleSummary =
+    rules.map(
+      r =>
+        `RULE ${r.id}: ${r.name}\n` +
+        `FORBIDDEN: ${r.bad.join(", ")}\n` +
+        `REQUIRED: ${r.good.join(", ")}`
+    ).join("\n\n");
+
+  const sourceText =
+    sources.map(
+      (s, i) =>
+        `SOURCE ${i + 1}
+NAME: ${s.name}
+URL: ${s.url}
+
+TEXT:
+${s.text}`
+    ).join(
+      "\n\n==============================\n\n"
+    );
+
+  const system = `
+You are the first-stage Gift Hunter extraction engine.
+
+Your job is ONLY to find genuine financial or cryptocurrency
+free-gift offers that are explicitly present in the supplied
+source text.
+
+Do NOT invent offers.
+
+Do NOT infer missing information.
+
+Do NOT treat a directory name as an offer.
+
+Every URL must come from the supplied source.
+
+Extract only offers that have enough direct text to investigate.
+
+Return ONLY JSON:
+
+{
+  "candidates": [
+    {
+      "title": "",
+      "description": "",
+      "value": "",
+      "type": "Financial|Crypto",
+      "expires": "",
+      "url": "",
+      "source": "",
+      "requirements": "",
+      "terms": "",
+      "faq": ""
+    }
+  ]
+}
+
+Important:
+- A reward must have monetary or crypto/digital value.
+- "Free trial", discount, coupon, points with no monetary value,
+  job, survey-only reward, affiliate commission, cashback,
+  purchase discount, or ordinary promotion is not automatically
+  a qualifying gift.
+- Do not decide final eligibility here.
+- If evidence is insufficient, do not invent it.
+
+RULES FOR THE SECOND STAGE:
+${ruleSummary}
+`;
+
+  const result =
+    await askNvidia(
+      [
+        {
+          role: "system",
+          content: system,
+        },
+        {
+          role: "user",
+          content: sourceText.slice(
+            0,
+            MAX_TOTAL_CHARS
+          ),
+        },
+      ],
+      {
+        apiKey:
+          env.NVIDIA_API_KEY,
+
+        maxTokens: 10000,
+
+        temperature: 0,
+
+        topP: 1,
+      }
+    );
+
+  const parsed =
+    parseJsonResponse(
+      result.content
+    );
+
+  return Array.isArray(
+    parsed?.candidates
+  )
+    ? parsed.candidates
+    : [];
+}
+
+/* -------------------------------------------------------
+   المرحلة الثانية:
+   التحقق من كل شرط على حدة
+------------------------------------------------------- */
+
+async function verifyCandidates(
+  candidates,
+  rules,
+  env
+) {
+  if (!candidates.length) {
+    return [];
+  }
+
+  const ruleText =
+    rules.map(
+      r =>
+        `RULE ${r.id}
+NAME: ${r.name}
+FORBIDDEN INDICATORS:
+${r.bad.join(", ")}
+
+REQUIRED POSITIVE EVIDENCE:
+${r.good.join(", ")}`
+    ).join("\n\n");
+
+  const candidateText =
+    candidates
+      .slice(0, 20)
+      .map(
+        (c, i) =>
+          `CANDIDATE ${i + 1}
+
+TITLE: ${c.title}
+DESCRIPTION: ${c.description}
+VALUE: ${c.value}
+TYPE: ${c.type}
+EXPIRES: ${c.expires}
+URL: ${c.url}
+SOURCE: ${c.source}
+REQUIREMENTS: ${c.requirements}
+TERMS: ${c.terms}
+FAQ: ${c.faq}`
+      )
+      .join(
+        "\n\n==============================\n\n"
+      );
+
+  const system = `
+You are the FINAL and EXTREMELY STRICT Gift Hunter verifier.
+
+You must verify every candidate against EXACTLY 37 rules.
+
+CRITICAL:
+
+1. PASS requires direct evidence contained in the candidate data.
+2. Missing evidence = UNKNOWN.
+3. Ambiguous evidence = UNKNOWN.
+4. Contradictory evidence = UNKNOWN unless the text clearly resolves it.
+5. A condition that requires payment, purchase, deposit, subscription,
+   paid membership, paid transaction, or another prohibited action
+   causes the relevant rule to FAIL.
+6. "No purchase necessary" is NOT a failure.
+7. Never infer that something is free merely because it is called
+   "giveaway", "airdrop", "bonus", "reward", or "free".
+8. Rule 36 MUST have direct evidence that the reward itself has
+   monetary or cryptocurrency/digital-asset value.
+9. Rule 37 MUST have direct evidence that receiving the reward is
+   free and does not require a prohibited payment/action.
+10. A candidate is eligible ONLY if ALL 37 rules are PASS.
+11. If even ONE rule is UNKNOWN or FAIL, eligible MUST be false.
+12. Every rule must have an evidence explanation.
+13. Do not invent evidence.
+14. Do not invent URLs.
+15. Do not change the candidate URL.
+
+Return ONLY valid JSON:
+
+{
+  "candidates": [
+    {
+      "title": "",
+      "description": "",
+      "value": "",
+      "type": "",
+      "expires": "",
+      "url": "",
+      "source": "",
+      "requirements": "",
+      "terms": "",
+      "faq": "",
+      "ruleResults": [
+        {
+          "id": 1,
+          "status": "PASS|FAIL|UNKNOWN",
+          "evidence": ""
+        }
+      ]
+    }
+  ]
+}
+
+The ruleResults array MUST contain exactly one entry
+for EVERY supplied rule ID.
+
+RULES:
+${ruleText}
+`;
+
+  const result =
+    await askNvidia(
+      [
+        {
+          role: "system",
+          content: system,
+        },
+        {
+          role: "user",
+          content: candidateText,
+        },
+      ],
+      {
+        apiKey:
+          env.NVIDIA_API_KEY,
+
+        maxTokens: 14000,
+
+        temperature: 0,
+
+        topP: 1,
+      }
+    );
+
+  const parsed =
+    parseJsonResponse(
+      result.content
+    );
+
+  return Array.isArray(
+    parsed?.candidates
+  )
+    ? parsed.candidates
+    : [];
+}
+
+/* -------------------------------------------------------
+   توحيد النتيجة وإجبارها على 37/37
+------------------------------------------------------- */
+
+function normalizeCandidate(
+  candidate,
+  rules
+) {
+  if (!candidate) {
+    return null;
+  }
+
+  const verification =
+    verifyRuleResults(
+      candidate,
+      rules
+    );
+
+  const hasEvidence =
+    evidenceIsValid(
+      verification.rules
+    );
+
+  const eligible =
+    verification.eligible &&
+    hasEvidence;
+
+  return {
+    title:
+      String(candidate.title || "")
+        .trim(),
+
+    description:
+      String(
+        candidate.description || ""
+      ).trim(),
+
+    value:
+      String(candidate.value || "")
+        .trim(),
+
+    type:
+      String(candidate.type || "")
+        .trim(),
+
+    expires:
+      String(candidate.expires || "")
+        .trim(),
+
+    url:
+      String(candidate.url || "")
+        .trim(),
+
+    source:
+      String(candidate.source || "")
+        .trim(),
+
+    requirements:
+      String(
+        candidate.requirements || ""
+      ).trim(),
+
+    terms:
+      String(candidate.terms || "")
+        .trim(),
+
+    faq:
+      String(candidate.faq || "")
+        .trim(),
+
+    eligible,
+
+    verification: {
+      passed:
+        verification.passed,
+
+      failed:
+        verification.failed,
+
+      unknown:
+        verification.unknown,
+
+      total:
+        rules.length,
+
+      evidenceComplete:
+        hasEvidence,
+
+      rules:
+        verification.rules,
+    },
+  };
+}
+
+/* -------------------------------------------------------
+   /scan
+------------------------------------------------------- */
 
 async function handleScan(
   request,
   env,
   origin
 ) {
+  if (!env.NVIDIA_API_KEY) {
+    return json(
+      {
+        ok: false,
+        error:
+          "NVIDIA_API_KEY is not configured",
+      },
+      500,
+      origin
+    );
+  }
+
   let body;
 
   try {
@@ -776,7 +948,8 @@ async function handleScan(
     return json(
       {
         ok: false,
-        error: "Invalid JSON",
+        error:
+          "Invalid JSON",
       },
       400,
       origin
@@ -784,9 +957,7 @@ async function handleScan(
   }
 
   if (
-    !Array.isArray(
-      body?.urls
-    ) ||
+    !Array.isArray(body?.urls) ||
     body.urls.length === 0 ||
     body.urls.length > 10
   ) {
@@ -801,129 +972,239 @@ async function handleScan(
     );
   }
 
-  if (
-    !Array.isArray(
-      body?.rules
-    ) ||
-    body.rules.length !== 37
-  ) {
+  const rules =
+    buildRules(body.rules);
+
+  /*
+    أمان مهم:
+    التطبيق يجب أن يرسل 37 شرطًا.
+  */
+
+  if (rules.length !== 37) {
     return json(
       {
         ok: false,
         error:
-          "Exactly 37 rules are required from the application",
+          "Exactly 37 rules are required",
+        receivedRules:
+          rules.length,
       },
       400,
       origin
     );
   }
 
-  const sources =
-    await readSources(
-      body.urls
-    );
+  /* ---------------------------------------------------
+     قراءة المصادر
+  --------------------------------------------------- */
+
+  const sources = [];
+
+  const sourceErrors = [];
+
+  for (
+    const item of body.urls
+  ) {
+    try {
+      const source =
+        await readSource(item);
+
+      sources.push(source);
+    } catch (error) {
+      sourceErrors.push({
+        name:
+          item?.name || "",
+
+        url:
+          item?.url || "",
+
+        error:
+          String(error)
+            .slice(0, 300),
+      });
+    }
+  }
 
   if (!sources.length) {
     return json(
       {
         ok: true,
-        candidates: [],
+
         readableSources: 0,
+
         discoveredPages: 0,
+
+        candidatesFound: 0,
+
+        eligibleCount: 0,
+
+        candidates: [],
+
+        sourceErrors,
       },
       200,
       origin
     );
   }
 
+  /* ---------------------------------------------------
+     المرحلة الأولى: اكتشاف العروض
+  --------------------------------------------------- */
+
+  let discovered;
+
   try {
-    const result =
-      await analyzeWithNvidia(
+    discovered =
+      await discoverCandidates(
         sources,
-        body.rules,
+        rules,
         env
       );
-
-    const normalized = [];
-
-    for (
-      const item of
-      result.candidates || []
-    ) {
-      const candidate =
-        normalizeAndVerify(
-          item,
-          item?.source || "",
-          body.rules
-        );
-
-      if (candidate) {
-        normalized.push(
-          candidate
-        );
-      }
-    }
-
-    /*
-     * طبقة أمان نهائية:
-     * التطبيق لا يستلم إلا العروض
-     * التي اجتازت 37/37.
-     */
-    const eligible =
-      normalized.filter(
-        (x) =>
-          x.eligible === true &&
-          x.verification
-            .passed === 37 &&
-          x.verification
-            .failed === 0 &&
-          x.verification
-            .unknown === 0
-      );
-
-    return json(
-      {
-        ok: true,
-
-        readableSources:
-          sources.length,
-
-        discoveredPages:
-          sources.length,
-
-        candidatesFound:
-          normalized.length,
-
-        eligibleCount:
-          eligible.length,
-
-        candidates:
-          eligible,
-      },
-      200,
-      origin
-    );
-  } catch (e) {
+  } catch (error) {
     return json(
       {
         ok: false,
+
+        stage:
+          "candidate-discovery",
+
         error:
-          String(e).slice(
-            0,
-            1200
-          ),
+          String(error)
+            .slice(0, 1200),
 
         readableSources:
           sources.length,
 
-        discoveredPages:
-          sources.length,
+        sourceErrors,
       },
       502,
       origin
     );
   }
+
+  /* ---------------------------------------------------
+     المرحلة الثانية: تحقق 37 شرط
+  --------------------------------------------------- */
+
+  let verified;
+
+  try {
+    verified =
+      await verifyCandidates(
+        discovered,
+        rules,
+        env
+      );
+  } catch (error) {
+    return json(
+      {
+        ok: false,
+
+        stage:
+          "37-rule-verification",
+
+        error:
+          String(error)
+            .slice(0, 1200),
+
+        readableSources:
+          sources.length,
+
+        candidatesFound:
+          discovered.length,
+
+        sourceErrors,
+      },
+      502,
+      origin
+    );
+  }
+
+  /* ---------------------------------------------------
+     طبقة تحقق محلية نهائية
+  --------------------------------------------------- */
+
+  const normalized =
+    verified
+      .map(
+        c =>
+          normalizeCandidate(
+            c,
+            rules
+          )
+      )
+      .filter(Boolean);
+
+  /*
+    لا نرسل إلى التطبيق إلا النتائج التي:
+
+    37 قاعدة
+    37 PASS
+    0 FAIL
+    0 UNKNOWN
+    evidence موجود لكل PASS
+  */
+
+  const eligible =
+    normalized.filter(
+      c =>
+        c.eligible === true &&
+        c.verification.total === 37 &&
+        c.verification.passed === 37 &&
+        c.verification.failed === 0 &&
+        c.verification.unknown === 0 &&
+        c.verification.evidenceComplete === true
+    );
+
+  return json(
+    {
+      ok: true,
+
+      mode:
+        "strict-two-stage-37-rule-verification",
+
+      readableSources:
+        sources.length,
+
+      discoveredPages:
+        sources.reduce(
+          (sum, s) =>
+            sum +
+            Number(
+              s.discoveredPages || 0
+            ),
+          0
+        ),
+
+      candidatesFound:
+        normalized.length,
+
+      eligibleCount:
+        eligible.length,
+
+      /*
+        مهم:
+        candidates هنا تحتوي المؤهلة فقط.
+        أي نتيجة لم تصل إلى 37/37 لا تظهر للتطبيق.
+      */
+
+      candidates:
+        eligible,
+
+      rejected:
+        normalized.length -
+        eligible.length,
+
+      sourceErrors,
+    },
+    200,
+    origin
+  );
 }
+
+/* -------------------------------------------------------
+   Worker
+------------------------------------------------------- */
 
 export default {
   async fetch(
@@ -944,118 +1225,85 @@ export default {
         {
           status: 204,
           headers:
-            corsHeaders(
-              origin
-            ),
+            corsHeaders(origin),
         }
       );
     }
 
     const url =
-      new URL(
-        request.url
-      );
+      new URL(request.url);
 
-    /*
-     * اختبار الخادم
-     */
+    /* اختبار الخادم */
+
     if (
-      request.method ===
-        "GET" &&
+      request.method === "GET" &&
       url.pathname === "/"
     ) {
       return json(
         {
           ok: true,
+
           service:
             "Gift Hunter NVIDIA Proxy",
-          status: "online",
+
+          status:
+            "online",
+
           mode:
-            "deep-source-discovery-then-37-rule-verification",
+            "strict-two-stage-37-rule-verification",
+
+          rules:
+            37,
         },
         200,
         origin
       );
     }
 
-    /*
-     * اختبار NVIDIA
-     */
+    /* اختبار NVIDIA */
+
     if (
-      request.method ===
-        "GET" &&
-      url.pathname ===
-        "/test"
+      request.method === "GET" &&
+      url.pathname === "/test"
     ) {
       try {
-        const data =
-          await fetch(
-            NVIDIA_URL,
-            {
-              method: "POST",
-
-              headers: {
-                Authorization:
-                  `Bearer ${env.NVIDIA_API_KEY}`,
-
-                Accept:
-                  "application/json",
-
-                "Content-Type":
-                  "application/json",
+        const result =
+          await askNvidia(
+            [
+              {
+                role: "user",
+                content:
+                  "Reply with exactly: NVIDIA TEST OK",
               },
+            ],
+            {
+              apiKey:
+                env.NVIDIA_API_KEY,
 
-              body:
-                JSON.stringify({
-                  model:
-                    DEFAULT_MODEL,
+              maxTokens: 100,
 
-                  messages: [
-                    {
-                      role: "user",
-                      content:
-                        "Reply with exactly: NVIDIA TEST OK",
-                    },
-                  ],
-
-                  max_tokens: 100,
-                  temperature: 0,
-                  stream: false,
-                }),
+              temperature: 0,
             }
           );
 
-        const text =
-          await data.text();
-
-        let result;
-
-        try {
-          result =
-            JSON.parse(
-              text
-            );
-        } catch {
-          result = {
-            raw: text,
-          };
-        }
-
         return json(
           {
-            ok: data.ok,
+            ok: true,
+
             nvidia:
-              result,
+              result.data,
           },
-          data.status,
+          200,
           origin
         );
-      } catch (e) {
+      } catch (error) {
         return json(
           {
             ok: false,
+
             error:
-              String(e),
+              String(error)
+                .slice(0, 1000),
           },
           502,
           origin
@@ -1063,14 +1311,11 @@ export default {
       }
     }
 
-    /*
-     * البحث العميق
-     */
+    /* الفحص */
+
     if (
-      request.method ===
-        "POST" &&
-      url.pathname ===
-        "/scan"
+      request.method === "POST" &&
+      url.pathname === "/scan"
     ) {
       return handleScan(
         request,
@@ -1079,18 +1324,13 @@ export default {
       );
     }
 
-    /*
-     * اتصال NVIDIA مباشر
-     */
+    /* توافق مع /nvidia */
+
     if (
-      request.method ===
-        "POST" &&
-      url.pathname ===
-        "/nvidia"
+      request.method === "POST" &&
+      url.pathname === "/nvidia"
     ) {
-      if (
-        !env.NVIDIA_API_KEY
-      ) {
+      if (!env.NVIDIA_API_KEY) {
         return json(
           {
             ok: false,
@@ -1136,71 +1376,59 @@ export default {
       }
 
       try {
-        const response =
-          await fetch(
-            NVIDIA_URL,
+        const result =
+          await askNvidia(
+            body.messages,
             {
-              method: "POST",
+              apiKey:
+                env.NVIDIA_API_KEY,
 
-              headers: {
-                Authorization:
-                  `Bearer ${env.NVIDIA_API_KEY}`,
+              model:
+                body.model ||
+                DEFAULT_MODEL,
 
-                Accept:
-                  "application/json",
+              maxTokens:
+                Math.min(
+                  Number(
+                    body.max_tokens
+                  ) || 4096,
+                  14000
+                ),
 
-                "Content-Type":
-                  "application/json",
-              },
-
-              body:
-                JSON.stringify({
-                  ...body,
-
-                  model:
-                    body.model ||
-                    DEFAULT_MODEL,
-
-                  stream: false,
-                }),
+              temperature:
+                typeof body.temperature ===
+                "number"
+                  ? Math.max(
+                      0,
+                      Math.min(
+                        body.temperature,
+                        1
+                      )
+                    )
+                  : 0.1,
             }
           );
 
-        const text =
-          await response.text();
-
-        let data;
-
-        try {
-          data =
-            JSON.parse(
-              text
-            );
-        } catch {
-          data = {
-            raw: text,
-          };
-        }
-
         return json(
           {
-            ok:
-              response.ok,
+            ok: true,
 
-            status:
-              response.status,
+            status: 200,
 
-            data,
+            data:
+              result.data,
           },
-          response.status,
+          200,
           origin
         );
-      } catch (e) {
+      } catch (error) {
         return json(
           {
             ok: false,
+
             error:
-              String(e),
+              String(error)
+                .slice(0, 1200),
           },
           502,
           origin
