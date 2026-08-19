@@ -1,424 +1,694 @@
-const NVIDIA_URL =
-  "https://integrate.api.nvidia.com/v1/chat/completions";
+import os
+import time
+import json
+import logging
+from dataclasses import dataclass
 
-const DEFAULT_MODEL =
-  "nvidia/nemotron-3-super-120b-a12b";
+import requests
+from dotenv import load_dotenv
 
-const MAX_SOURCE_CHARS = 12000;
-const MAX_TOTAL_CHARS = 50000;
-const MAX_LINKS_PER_SOURCE = 12;
+load_dotenv()
 
-function corsHeaders(origin = "*") {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization",
-    "Access-Control-Max-Age": "86400",
-  };
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-function json(data, status = 200, origin = "*") {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(origin),
-    },
-  });
-}
 
-/* -------------------------------------------------------
-   تنظيف HTML وتحويله إلى نص قابل للتحليل
-------------------------------------------------------- */
+@dataclass
+class Task:
+    id: str
+    title: str
+    description: str
+    reward_usd: float
+    skills: list[str]
+    status: str = "open"
 
-function decodeHtml(text) {
-  return String(text || "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#x27;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
 
-function stripHtml(html) {
-  return decodeHtml(
-    String(html || "")
-      .replace(
-        /<script[\s\S]*?<\/script>/gi,
-        " "
-      )
-      .replace(
-        /<style[\s\S]*?<\/style>/gi,
-        " "
-      )
-      .replace(
-        /<noscript[\s\S]*?<\/noscript>/gi,
-        " "
-      )
-      .replace(
-        /<svg[\s\S]*?<\/svg>/gi,
-        " "
-      )
-      .replace(
-        /<iframe[\s\S]*?<\/iframe>/gi,
-        " "
-      )
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-  );
-}
+@dataclass
+class Decision:
+    accept: bool
+    score: float
+    reason: str
+    bid_usd: float
 
-function cleanText(text) {
-  return String(text || "")
-    .replace(/\u0000/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n\s*\n\s*\n+/g, "\n\n")
-    .trim();
-}
 
-/* -------------------------------------------------------
-   حماية بسيطة من SSRF
-------------------------------------------------------- */
+class Marketplace:
 
-function validHostname(hostname) {
-  if (!hostname) return false;
+    def __init__(self):
+        self.base = os.getenv(
+            "MARKETPLACE_BASE_URL", ""
+        ).rstrip("/")
 
-  if (
-    /^(localhost|127\.0\.0\.1|0\.0\.0\.0)$/i.test(
-      hostname
+        self.key = os.getenv(
+            "MARKETPLACE_API_KEY", ""
+        )
+
+        self.demo = not self.base
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json"
+        }
+
+    def tasks(self):
+
+        if self.demo:
+
+            return [
+                Task(
+                    "demo-1",
+                    "Product data extraction",
+                    "Collect public product names, prices and URLs and return clean JSON.",
+                    25,
+                    ["research", "web", "data"]
+                ),
+
+                Task(
+                    "demo-2",
+                    "Simple logo design",
+                    "Create a brand logo from a supplied brief.",
+                    40,
+                    ["design"]
+                ),
+
+                Task(
+                    "demo-3",
+                    "Price comparison",
+                    "Compare public prices for a list of products.",
+                    15,
+                    ["research", "data"]
+                )
+            ]
+
+        response = requests.get(
+            f"{self.base}/tasks",
+            headers=self._headers(),
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return [
+            Task(**task)
+            for task in response.json()
+        ]
+
+    def bid(self, task_id, bid_usd, message):
+
+        if self.demo:
+
+            logging.info(
+                "DEMO BID | task=%s | $%.2f | %s",
+                task_id,
+                bid_usd,
+                message
+            )
+
+            return {"accepted": True}
+
+        response = requests.post(
+            f"{self.base}/tasks/{task_id}/bids",
+            headers=self._headers(),
+            json={
+                "amount_usd": bid_usd,
+                "message": message
+            },
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    def submit(self, task_id, result):
+
+        if self.demo:
+
+            logging.info(
+                "DEMO SUBMIT | task=%s | result=%s",
+                task_id,
+                result[:300]
+            )
+
+            return {"submitted": True}
+
+        response = requests.post(
+            f"{self.base}/tasks/{task_id}/submit",
+            headers=self._headers(),
+            json={
+                "result": result
+            },
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+class Worker:
+
+    SKILLS = {
+        "research",
+        "web",
+        "data",
+        "analysis",
+        "text",
+        "automation",
+        "translation"
+    }
+
+    def decide(self, task: Task):
+
+        minimum_reward = float(
+            os.getenv("MIN_REWARD_USD", "5")
+        )
+
+        if task.reward_usd < minimum_reward:
+
+            return Decision(
+                False,
+                0,
+                "reward below minimum",
+                0
+            )
+
+        overlap = len(
+            self.SKILLS.intersection(
+                set(map(str.lower, task.skills))
+            )
+        )
+
+        score = min(
+            1.0,
+            0.45 + overlap * 0.18
+        )
+
+        if overlap == 0:
+
+            return Decision(
+                False,
+                score,
+                "required skills unavailable",
+                0
+            )
+
+        bid = round(
+            max(
+                5,
+                task.reward_usd * 0.92
+            ),
+            2
+        )
+
+        return Decision(
+            score >= 0.63,
+            score,
+            "skills match",
+            bid
+        )
+
+    def execute(self, task: Task):
+
+        return json.dumps(
+            {
+                "task_id": task.id,
+                "status": "completed",
+                "worker": os.getenv(
+                    "WORKER_NAME",
+                    "PaidWorker"
+                ),
+                "note": (
+                    "Task execution adapter is ready; "
+                    "connect the permitted marketplace/task tools."
+                )
+            },
+            ensure_ascii=False
+        )
+
+    def verify(self, result):
+
+        try:
+
+            data = json.loads(result)
+
+            return (
+                data.get("status") == "completed"
+                and bool(data.get("task_id"))
+            )
+
+        except Exception:
+
+            return False
+
+
+def main():
+
+    marketplace = Marketplace()
+    worker = Worker()
+
+    dry_run = (
+        os.getenv(
+            "DRY_RUN",
+            "true"
+        ).lower() == "true"
     )
-  ) {
-    return false;
-  }
 
-  if (
-    hostname === "::1" ||
-    hostname.endsWith(".local")
-  ) {
-    return false;
-  }
+    auto_bid = (
+        os.getenv(
+            "AUTO_BID",
+            "false"
+        ).lower() == "true"
+    )
 
-  return true;
-}
+    logging.info(
+        "Worker started | demo=%s | dry_run=%s | auto_bid=%s",
+        marketplace.demo,
+        dry_run,
+        auto_bid
+    )
 
-/* -------------------------------------------------------
-   قراءة المصدر
-------------------------------------------------------- */
+    while True:
 
-async function fetchText(url) {
-  const response = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 Gift-Hunter/2.0",
-      "Accept":
-        "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
-      "Accept-Language":
-        "en-US,en;q=0.9",
-    },
-  });
+        try:
 
-  if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status}`
-    );
-  }
+            tasks = marketplace.tasks()
 
-  const type =
-    response.headers.get("content-type") || "";
+            tasks = tasks[
+                :int(
+                    os.getenv(
+                        "MAX_TASKS_PER_CYCLE",
+                        "10"
+                    )
+                )
+            ]
 
-  const raw = await response.text();
+            for task in tasks:
 
-  let text;
+                decision = worker.decide(task)
 
-  if (/json/i.test(type)) {
-    text = raw;
-  } else {
-    text = stripHtml(raw);
-  }
+                logging.info(
+                    "TASK %s | $%.2f | score=%.2f | accept=%s | %s",
+                    task.id,
+                    task.reward_usd,
+                    decision.score,
+                    decision.accept,
+                    decision.reason
+                )
 
-  return cleanText(text);
-}
+                if not decision.accept:
+                    continue
 
-/* -------------------------------------------------------
-   استخراج الروابط من الصفحة
-------------------------------------------------------- */
+                if not auto_bid:
+                    continue
 
-function extractLinks(html, baseUrl) {
-  const links = [];
+                marketplace.bid(
+                    task.id,
+                    decision.bid_usd,
+                    "I can complete this task using my available research/data workflow."
+                )
 
-  const regex =
-    /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>/gi;
+            if dry_run:
 
-  let match;
+                logging.info(
+                    "Dry-run: no real payment action is performed."
+                )
 
-  while (
-    (match = regex.exec(html)) !== null &&
-    links.length < MAX_LINKS_PER_SOURCE
-  ) {
-    try {
-      const absolute =
-        new URL(match[1], baseUrl);
+            time.sleep(
+                int(
+                    os.getenv(
+                        "POLL_SECONDS",
+                        "30"
+                    )
+                )
+            )
 
-      if (
-        absolute.protocol === "https:" &&
-        validHostname(absolute.hostname)
-      ) {
-        links.push(absolute.toString());
-      }
-    } catch {}
-  }
+        except KeyboardInterrupt:
 
-  return [...new Set(links)];
-}
+            logging.info(
+                "Worker stopped."
+            )
 
-/* -------------------------------------------------------
-   قراءة مصدر مع محاولة العثور على صفحات الشروط
-------------------------------------------------------- */
+            break
 
-async function readSource(item) {
-  const originalUrl = new URL(item.url);
+        except Exception:
 
-  if (
-    originalUrl.protocol !== "https:" ||
-    !validHostname(originalUrl.hostname)
-  ) {
-    throw new Error("Invalid source URL");
-  }
+            logging.exception(
+                "Cycle failed; retrying."
+            )
 
-  const response = await fetch(
-    originalUrl.toString(),
-    {
-      method: "GET",
-      redirect: "follow",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 Gift-Hunter/2.0",
-        "Accept":
-          "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
-        "Accept-Language":
-          "en-US,en;q=0.9",
-      },
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()import os
+import time
+import json
+import logging
+from dataclasses import dataclass
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+
+@dataclass
+class Task:
+    id: str
+    title: str
+    description: str
+    reward_usd: float
+    skills: list[str]
+    status: str = "open"
+
+
+@dataclass
+class Decision:
+    accept: bool
+    score: float
+    reason: str
+    bid_usd: float
+
+
+class Marketplace:
+
+    def __init__(self):
+        self.base = os.getenv(
+            "MARKETPLACE_BASE_URL", ""
+        ).rstrip("/")
+
+        self.key = os.getenv(
+            "MARKETPLACE_API_KEY", ""
+        )
+
+        self.demo = not self.base
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json"
+        }
+
+    def tasks(self):
+
+        if self.demo:
+
+            return [
+                Task(
+                    "demo-1",
+                    "Product data extraction",
+                    "Collect public product names, prices and URLs and return clean JSON.",
+                    25,
+                    ["research", "web", "data"]
+                ),
+
+                Task(
+                    "demo-2",
+                    "Simple logo design",
+                    "Create a brand logo from a supplied brief.",
+                    40,
+                    ["design"]
+                ),
+
+                Task(
+                    "demo-3",
+                    "Price comparison",
+                    "Compare public prices for a list of products.",
+                    15,
+                    ["research", "data"]
+                )
+            ]
+
+        response = requests.get(
+            f"{self.base}/tasks",
+            headers=self._headers(),
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return [
+            Task(**task)
+            for task in response.json()
+        ]
+
+    def bid(self, task_id, bid_usd, message):
+
+        if self.demo:
+
+            logging.info(
+                "DEMO BID | task=%s | $%.2f | %s",
+                task_id,
+                bid_usd,
+                message
+            )
+
+            return {"accepted": True}
+
+        response = requests.post(
+            f"{self.base}/tasks/{task_id}/bids",
+            headers=self._headers(),
+            json={
+                "amount_usd": bid_usd,
+                "message": message
+            },
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    def submit(self, task_id, result):
+
+        if self.demo:
+
+            logging.info(
+                "DEMO SUBMIT | task=%s | result=%s",
+                task_id,
+                result[:300]
+            )
+
+            return {"submitted": True}
+
+        response = requests.post(
+            f"{self.base}/tasks/{task_id}/submit",
+            headers=self._headers(),
+            json={
+                "result": result
+            },
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+class Worker:
+
+    SKILLS = {
+        "research",
+        "web",
+        "data",
+        "analysis",
+        "text",
+        "automation",
+        "translation"
     }
-  );
 
-  if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status}`
-    );
-  }
+    def decide(self, task: Task):
 
-  const type =
-    response.headers.get("content-type") || "";
+        minimum_reward = float(
+            os.getenv("MIN_REWARD_USD", "5")
+        )
 
-  const raw = await response.text();
+        if task.reward_usd < minimum_reward:
 
-  let text;
+            return Decision(
+                False,
+                0,
+                "reward below minimum",
+                0
+            )
 
-  if (/json/i.test(type)) {
-    text = raw;
-  } else {
-    text = stripHtml(raw);
-  }
+        overlap = len(
+            self.SKILLS.intersection(
+                set(map(str.lower, task.skills))
+            )
+        )
 
-  text = cleanText(text);
+        score = min(
+            1.0,
+            0.45 + overlap * 0.18
+        )
 
-  if (!text || text.length < 80) {
-    throw new Error("Source has insufficient readable text");
-  }
+        if overlap == 0:
 
-  /*
-    نبحث عن روابط مهمة داخل الصفحة.
-    لا نعتبرها دليلًا بحد ذاتها؛ فقط نحاول قراءة
-    صفحة الشروط/القواعد إذا كانت واضحة.
-  */
+            return Decision(
+                False,
+                score,
+                "required skills unavailable",
+                0
+            )
 
-  const discoveredLinks =
-    /html/i.test(type)
-      ? extractLinks(raw, originalUrl.toString())
-      : [];
+        bid = round(
+            max(
+                5,
+                task.reward_usd * 0.92
+            ),
+            2
+        )
 
-  const usefulLinks =
-    discoveredLinks.filter((link) =>
-      /(terms|rules|official|giveaway|contest|sweepstake|airdrop|reward|eligib|faq|condition)/i.test(
-        link
-      )
-    ).slice(0, 4);
+        return Decision(
+            score >= 0.63,
+            score,
+            "skills match",
+            bid
+        )
 
-  const extraTexts = [];
+    def execute(self, task: Task):
 
-  for (const link of usefulLinks) {
-    try {
-      const extra =
-        await fetchText(link);
+        return json.dumps(
+            {
+                "task_id": task.id,
+                "status": "completed",
+                "worker": os.getenv(
+                    "WORKER_NAME",
+                    "PaidWorker"
+                ),
+                "note": (
+                    "Task execution adapter is ready; "
+                    "connect the permitted marketplace/task tools."
+                )
+            },
+            ensure_ascii=False
+        )
 
-      if (extra && extra.length >= 80) {
-        extraTexts.push(
-          `\n\n--- RELATED PAGE ---\nURL: ${link}\n${extra.slice(
-            0,
-            5000
-          )}`
-        );
-      }
-    } catch {}
-  }
+    def verify(self, result):
 
-  const combined =
-    cleanText(
-      text.slice(0, MAX_SOURCE_CHARS) +
-      extraTexts.join("")
-    );
+        try:
 
-  return {
-    name:
-      item.name ||
-      originalUrl.hostname,
+            data = json.loads(result)
 
-    url: originalUrl.toString(),
+            return (
+                data.get("status") == "completed"
+                and bool(data.get("task_id"))
+            )
 
-    text: combined.slice(
-      0,
-      MAX_SOURCE_CHARS + 18000
-    ),
+        except Exception:
 
-    discoveredPages:
-      usefulLinks.length,
-  };
-}
+            return False
 
-/* -------------------------------------------------------
-   NVIDIA
-------------------------------------------------------- */
 
-async function askNvidia(messages, options = {}) {
-  if (!options.apiKey) {
-    throw new Error(
-      "NVIDIA_API_KEY is not configured"
-    );
-  }
+def main():
 
-  const response = await fetch(
-    NVIDIA_URL,
-    {
-      method: "POST",
+    marketplace = Marketplace()
+    worker = Worker()
 
-      headers: {
-        Authorization:
-          `Bearer ${options.apiKey}`,
-        Accept:
-          "application/json",
-        "Content-Type":
-          "application/json",
-      },
+    dry_run = (
+        os.getenv(
+            "DRY_RUN",
+            "true"
+        ).lower() == "true"
+    )
 
-      body: JSON.stringify({
-        model:
-          options.model ||
-          DEFAULT_MODEL,
+    auto_bid = (
+        os.getenv(
+            "AUTO_BID",
+            "false"
+        ).lower() == "true"
+    )
 
-        messages,
+    logging.info(
+        "Worker started | demo=%s | dry_run=%s | auto_bid=%s",
+        marketplace.demo,
+        dry_run,
+        auto_bid
+    )
 
-        max_tokens:
-          options.maxTokens || 12000,
+    while True:
 
-        temperature:
-          options.temperature ?? 0,
+        try:
 
-        top_p:
-          options.topP ?? 1,
+            tasks = marketplace.tasks()
 
-        stream: false,
-      }),
-    }
-  );
+            tasks = tasks[
+                :int(
+                    os.getenv(
+                        "MAX_TASKS_PER_CYCLE",
+                        "10"
+                    )
+                )
+            ]
 
-  const text =
-    await response.text();
+            for task in tasks:
 
-  if (!response.ok) {
-    throw new Error(
-      `NVIDIA HTTP ${response.status}: ${text.slice(
-        0,
-        800
-      )}`
-    );
-  }
+                decision = worker.decide(task)
 
-  let data;
+                logging.info(
+                    "TASK %s | $%.2f | score=%.2f | accept=%s | %s",
+                    task.id,
+                    task.reward_usd,
+                    decision.score,
+                    decision.accept,
+                    decision.reason
+                )
 
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(
-      "NVIDIA returned invalid JSON"
-    );
-  }
+                if not decision.accept:
+                    continue
 
-  const content =
-    data?.choices?.[0]?.message?.content ||
-    "";
+                if not auto_bid:
+                    continue
 
-  return {
-    data,
-    content: String(content),
-  };
-}
+                marketplace.bid(
+                    task.id,
+                    decision.bid_usd,
+                    "I can complete this task using my available research/data workflow."
+                )
 
-/* -------------------------------------------------------
-   استخراج JSON من رد NVIDIA
-------------------------------------------------------- */
+            if dry_run:
 
-function parseJsonResponse(content) {
-  let text = String(content || "")
-    .trim();
+                logging.info(
+                    "Dry-run: no real payment action is performed."
+                )
 
-  text = text
-    .replace(/^```json/i, "")
-    .replace(/^```/i, "")
-    .replace(/```$/i, "")
-    .trim();
+            time.sleep(
+                int(
+                    os.getenv(
+                        "POLL_SECONDS",
+                        "30
+                    )
+                )
+            )
 
-  try {
-    return JSON.parse(text);
-  } catch {}
+        except KeyboardInterrupt:
 
-  const first =
-    text.indexOf("{");
+            logging.info(
+                "Worker stopped."
+            )
 
-  const last =
-    text.lastIndexOf("}");
+            break
 
-  if (
-    first >= 0 &&
-    last > first
-  ) {
-    try {
-      return JSON.parse(
-        text.slice(first, last + 1)
-      );
-    } catch {}
-  }
+        except Exception:
 
-  return {
-    candidates: [],
-  };
-}
+            logging.exception(
+                "Cycle failed; retrying."
+            )
 
-/* -------------------------------------------------------
-   بناء قائمة الشروط
-------------------------------------------------------- */
+            time.sleep(10)
 
-function buildRules(rules) {
-  if (!Array.isArray(rules)) {
-    return [];
-  }
 
-  return rules.map((r, index) => ({
+if __name__ == "__main__":
+    main()  return rules.map((r, index) => ({
     id:
       Number.isFinite(Number(r.id))
         ? Number(r.id)
